@@ -82,11 +82,11 @@ function showError(id, error) {
   element.hidden = !error;
 }
 
-async function request(path, method = "GET", body) {
+async function request(path, method = "GET", body, contentType = "application/json") {
   const init = { method };
   if (body !== undefined) {
-    init.headers = { "Content-Type": "application/json" };
-    init.body = JSON.stringify(body);
+    init.headers = { "Content-Type": contentType };
+    init.body = contentType === "application/json" ? JSON.stringify(body) : body;
   }
   const response = await fetch(apiBase + path, init);
   if (!response.ok) {
@@ -115,6 +115,7 @@ function messageNode(message) {
   time.dateTime = message.ts;
   time.title = date.format(new Date(message.ts));
   meta.append(label, time);
+  if (message.plan) meta.append(node("span", "plan-chip", "План"));
   article.append(avatar(message.author), content);
   content.append(meta);
 
@@ -126,8 +127,13 @@ function messageNode(message) {
     const body = node("div", "markdown");
     body.innerHTML = markdown.render(message.text);
     content.append(body);
-  } else {
+  } else if (message.text) {
     content.append(node("p", "message-body", message.text));
+  }
+  if (message.attachments?.length) {
+    const files = node("div", "attachment-list");
+    for (const item of message.attachments) files.append(attachmentChip(item));
+    content.append(files);
   }
   return article;
 }
@@ -222,23 +228,14 @@ function renderControls() {
     radio.checked = radio.value === target;
     radio.disabled = !room || !connected || sending.has(activeId) || savingTarget.has(activeId);
   }
-  $("send").disabled = !room || !connected || !draft.value.trim() || sending.has(activeId) || savingTarget.has(activeId);
+  $("send").disabled = !room || !connected || (!draft.value.trim() && !pendingFiles.get(activeId)?.length) || sending.has(activeId) || savingTarget.has(activeId);
   $("stop").hidden = !room?.busy.length;
   $("stop").disabled = !connected || stopping.has(activeId);
   $("queue-status").textContent = room?.busy.map((agent) => `${names[agent]} работает…`).join("  ") || "";
-  for (const button of document.querySelectorAll("[data-agent-settings]")) {
-    const agent = button.dataset.agentSettings;
-    const settings = room?.agents?.[agent];
-    const model = settings?.model;
-    const modelName = model ? modelCatalog?.[agent]?.find((entry) => entry.id === model)?.name || model : "По умолчанию";
-    const permission = permissions[settings?.permission]?.[0];
-    const caption = button.querySelector(".agent-config");
-    caption.textContent = [modelName, settings?.effort, permission].filter(Boolean).join(" · ");
-    button.title = caption.textContent;
-    button.disabled = !connected || !settings;
-    button.classList.toggle("full-access", settings?.permission === "full");
+  for (const agent of agents) {
     $("status-" + agent).textContent = contextSummary(room?.context?.[agent]);
   }
+  renderComposerControls(room);
 }
 
 function contextSummary(context) {
@@ -401,10 +398,12 @@ async function loadHistory(id, scrollToEnd = false) {
 }
 
 function selectRoom(id, { load = true } = {}) {
+  closeComposerPopover();
   activeId = id;
   if (id) localStorage.setItem("mecode.room", id);
   else localStorage.removeItem("mecode.room");
   draft.value = drafts.get(id) || "";
+  renderDraftFiles();
   setRoomMenu(false);
   showError("inline-error", null);
   closeMentions();
@@ -422,6 +421,8 @@ function forgetRoom(id) {
   history.delete(id);
   streams.delete(id);
   drafts.delete(id);
+  pendingFiles.delete(id);
+  plannedRooms.delete(id);
   if (activeId === id) selectRoom(rooms.keys().next().value || null);
   else renderRooms();
 }
@@ -637,12 +638,21 @@ composer.addEventListener("submit", async (event) => {
   if ($("send").disabled) return;
   const id = activeId;
   const raw = draft.value;
+  const files = pendingFiles.get(id) || [];
+  const plan = plannedRooms.has(id);
   sending.add(id);
+  renderDraftFiles();
   closeMentions();
   showError("inline-error", null);
   renderControls();
   try {
-    await request(roomPath(id, "/messages"), "POST", { text: raw.trim() });
+    const payload = { text: raw.trim() };
+    if (files.length) payload.attachments = await uploadFiles(id, files);
+    if (plan) payload.plan = true;
+    await request(roomPath(id, "/messages"), "POST", payload);
+    pendingFiles.delete(id);
+    if (plan) plannedRooms.delete(id);
+    if (activeId === id) renderDraftFiles();
     if (drafts.get(id) === raw) {
       drafts.delete(id);
       if (activeId === id) draft.value = "";
@@ -651,6 +661,7 @@ composer.addEventListener("submit", async (event) => {
     if (activeId === id) showError("inline-error", error);
   } finally {
     sending.delete(id);
+    if (activeId === id) renderDraftFiles();
     renderControls();
   }
 });
@@ -773,22 +784,6 @@ function addOption(select, value, label) {
   select.append(element);
 }
 
-function updateEfforts(savedEffort = "") {
-  const { model, effort } = agentForm.elements;
-  const available = modelCatalog?.[agentEdit.agent] || [];
-  const details = model.value
-    ? available.find((entry) => entry.id === model.value)
-    : available.find((entry) => entry.is_default);
-  $("model-description").textContent = details?.description || "";
-  effort.replaceChildren();
-  const automatic = details?.default_effort;
-  addOption(effort, "", automatic ? `По умолчанию (${automatic})` : "По умолчанию");
-  const supported = new Set(details?.efforts || []);
-  if (savedEffort) supported.add(savedEffort);
-  for (const value of supported) addOption(effort, value, value);
-  effort.value = savedEffort;
-}
-
 function updatePermission() {
   const { permission, confirmFull } = agentForm.elements;
   const full = permission.value === "full";
@@ -800,55 +795,24 @@ function updatePermission() {
   confirmFull.checked = false;
 }
 
-async function openAgentSettings(button) {
-  const agent = button.dataset.agentSettings;
+function openAgentSettings(button) {
+  const agent = composerAgent;
   const settings = rooms.get(activeId)?.agents?.[agent];
   if (!settings || !connected) return;
-  const edit = { id: activeId, agent, originalPermission: settings.permission, button };
-  agentEdit = edit;
+  agentEdit = { id: activeId, agent, originalPermission: settings.permission, button };
   agentForm.reset();
   $("agent-dialog-title").textContent = `Настройки ${names[agent]}`;
-  const { model, effort, permission } = agentForm.elements;
-  model.replaceChildren();
-  addOption(model, "", "По умолчанию");
-  if (settings.model) addOption(model, settings.model, settings.model);
-  model.value = settings.model;
+  const { permission } = agentForm.elements;
   permission.replaceChildren();
   for (const [id, [label]] of Object.entries(permissions)) addOption(permission, id, label);
   permission.value = Object.hasOwn(permissions, settings.permission) ? settings.permission : "read";
-  updateEfforts(settings.effort);
   updatePermission();
   showError("agent-error", null);
-  model.disabled = effort.disabled = $("save-agent").disabled = true;
+  $("save-agent").disabled = false;
   agentDialog.showModal();
   permission.focus();
-  try {
-    const catalog = await loadModels();
-    if (agentEdit !== edit) return;
-    const entries = catalog[agent] || [];
-    model.replaceChildren();
-    const defaultModel = entries.find((entry) => entry.is_default);
-    addOption(model, "", defaultModel?.id ? `По умолчанию · ${defaultModel.name}` : "По умолчанию");
-    for (const entry of entries) {
-      if (entry.id) addOption(model, entry.id, entry.name);
-    }
-    if (settings.model && !entries.some((entry) => entry.id === settings.model)) {
-      addOption(model, settings.model, settings.model);
-    }
-    model.value = settings.model;
-    updateEfforts(settings.effort);
-    model.disabled = effort.disabled = false;
-  } catch {
-    if (agentEdit === edit) showError("agent-error", "Каталог моделей недоступен. Можно изменить разрешения.");
-  } finally {
-    if (agentEdit === edit) $("save-agent").disabled = !connected;
-  }
 }
 
-for (const button of document.querySelectorAll("[data-agent-settings]")) {
-  button.addEventListener("click", () => void openAgentSettings(button));
-}
-agentForm.elements.model.addEventListener("change", () => updateEfforts());
 agentForm.elements.permission.addEventListener("change", updatePermission);
 $("cancel-agent").addEventListener("click", () => agentDialog.close());
 agentDialog.addEventListener("cancel", (event) => {
@@ -862,17 +826,13 @@ agentForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!agentEdit || !connected || $("save-agent").disabled) return;
   const { id, agent } = agentEdit;
-  const { model, effort, permission } = agentForm.elements;
-  const settings = { model: model.value, effort: effort.value, permission: permission.value };
+  const current = rooms.get(id)?.agents?.[agent];
+  if (!current) return;
+  const settings = { ...current, permission: agentForm.elements.permission.value };
   $("cancel-agent").disabled = $("save-agent").disabled = true;
   showError("agent-error", null);
   try {
-    const result = await request(roomPath(id, `/agents/${agent}`), "PUT", settings);
-    if (rooms.has(id)) {
-      const room = rooms.get(id);
-      room.agents = { ...room.agents, [agent]: result.agents[agent] };
-      renderControls();
-    }
+    await persistAgent(id, agent, settings);
     agentDialog.close();
   } catch (error) {
     showError("agent-error", error);
@@ -966,6 +926,7 @@ document.addEventListener("click", (event) => {
   if (!$("room-actions").contains(event.target)) setRoomMenu(false);
 });
 
+initializeComposer();
 selectRoom(null, { load: false });
 if (apiBase) {
   connect();

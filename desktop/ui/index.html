@@ -6,6 +6,7 @@
   <title>Mecode</title>
   <link rel="stylesheet" href="styles.css">
   <script src="vendor/markdown-it.min.js" defer></script>
+  <script src="composer.js" defer></script>
   <script src="app.js" defer></script>
 </head>
 <body>
@@ -59,23 +60,65 @@
       <div class="composer-area">
         <form class="composer" id="composer">
           <div class="mention-list" id="mention-list" role="listbox" aria-label="Упоминания" hidden></div>
-          <textarea id="draft" rows="2" aria-label="Сообщение" placeholder="Напишите задачу. @ — выбрать агента" aria-autocomplete="list" aria-controls="mention-list"></textarea>
-          <div class="composer-agents" aria-label="Настройки агентов">
-            <button class="agent-control claude" type="button" data-agent-settings="claude" aria-controls="agent-dialog" aria-label="Настройки Claude"><span class="agent-dot claude"></span><strong>Claude</strong><span class="agent-config">По умолчанию</span><span aria-hidden="true">▾</span></button>
-            <button class="agent-control codex" type="button" data-agent-settings="codex" aria-controls="agent-dialog" aria-label="Настройки Codex"><span class="agent-dot codex"></span><strong>Codex</strong><span class="agent-config">По умолчанию</span><span aria-hidden="true">▾</span></button>
-          </div>
-          <div class="composer-footer">
+          <div class="composer-routing">
             <fieldset class="targets">
               <legend class="sr-only">Адресат сообщения</legend>
               <label><input type="radio" name="target" value="all" checked><span>Обоим</span></label>
               <label><input type="radio" name="target" value="claude"><span><i class="agent-dot claude"></i>Claude</span></label>
               <label><input type="radio" name="target" value="codex"><span><i class="agent-dot codex"></i>Codex</span></label>
             </fieldset>
+            <button type="button" class="plan-chip" id="plan-chip" hidden>План <span aria-hidden="true">×</span></button>
+          </div>
+          <div class="attachment-list" id="draft-files" hidden></div>
+          <textarea id="draft" rows="3" aria-label="Сообщение" placeholder="Что сделать дальше? Напишите @, чтобы выбрать агента" aria-autocomplete="list" aria-controls="mention-list"></textarea>
+          <div class="composer-footer">
+            <div class="composer-tools">
+              <button class="icon-button composer-icon" type="button" id="tools-toggle" aria-controls="composer-tools-panel" aria-expanded="false" aria-label="Инструменты сообщения" title="Инструменты сообщения">+</button>
+              <button class="model-control" type="button" id="model-toggle" aria-controls="composer-model-panel" aria-expanded="false" aria-label="Выбрать модель"><span class="agent-dot claude" id="model-dot"></span><strong id="model-current"></strong><span id="effort-current"></span><span aria-hidden="true">⌄</span></button>
+            </div>
             <div class="message-actions">
-              <button class="stop" type="button" id="stop" aria-label="Стоп" hidden>■ <span>Стоп</span></button>
-              <button class="send" type="submit" id="send" aria-label="Отправить" disabled><span>Отправить</span><b aria-hidden="true">↑</b></button>
+              <button type="button" class="permission-control" id="permission-toggle" aria-controls="agent-dialog"><span id="permission-current"></span> <span aria-hidden="true">⌄</span></button>
+              <button type="button" class="context-control" id="context-toggle" aria-controls="composer-context-panel" aria-expanded="false" aria-label="Контекст модели" title="Контекст модели"><span id="context-ring" aria-hidden="true">◌</span></button>
+              <button type="button" class="icon-button composer-icon microphone" aria-label="Микрофон — скоро" title="Микрофон — скоро" disabled><span aria-hidden="true"></span></button>
+              <button class="stop composer-icon" type="button" id="stop" aria-label="Стоп" title="Стоп" hidden>■</button>
+              <button class="send composer-icon" type="submit" id="send" aria-label="Отправить" title="Отправить" disabled><b aria-hidden="true">↑</b></button>
             </div>
           </div>
+          <input type="file" id="attachments-picker" multiple hidden>
+          <section class="composer-popover tools-popover" id="composer-tools-panel" aria-label="Инструменты сообщения" hidden>
+            <button type="button" id="attach-files"><i aria-hidden="true">↗</i> Прикрепить файлы</button>
+            <button type="button" disabled><i aria-hidden="true">◇</i> Навыки <small>скоро</small></button>
+            <button type="button" id="toggle-plan" aria-pressed="false"><i aria-hidden="true">≡</i> План</button>
+            <button type="button" disabled><i aria-hidden="true">◷</i> Автоматизация <small>скоро</small></button>
+            <button type="button" id="open-prompts"><i aria-hidden="true">›_</i> Промпты…</button>
+            <button type="button" disabled><i aria-hidden="true">⊞</i> Плагины <small>скоро</small></button>
+          </section>
+          <section class="composer-popover model-popover" id="composer-model-panel" aria-label="Модель и рассуждение" hidden>
+            <div class="picker-agents" role="group" aria-label="Агент">
+              <button type="button" data-picker-agent="claude" aria-pressed="true"><span class="agent-dot claude"></span>Claude</button>
+              <button type="button" data-picker-agent="codex" aria-pressed="false"><span class="agent-dot codex"></span>Codex</button>
+            </div>
+            <input type="search" id="model-search" aria-label="Поиск моделей" placeholder="Поиск моделей…">
+            <div class="picker-section">
+              <div class="section-label">Модель</div>
+              <div id="model-options" class="model-options" role="group" aria-label="Модели"></div>
+            </div>
+            <div class="picker-section">
+              <div class="section-label">Рассуждение</div>
+              <div id="reasoning-options" class="reasoning-options" role="group" aria-label="Уровень рассуждения"></div>
+            </div>
+            <label class="fast-option" id="fast-option" hidden><input id="fast-mode" type="checkbox"> ⚡ Fast mode</label>
+            <p id="model-error" class="inline-error" role="alert" hidden></p>
+            <div class="picker-actions">
+              <button type="button" id="handoff" class="icon-button">↗ В новый чат</button>
+              <button type="button" id="apply-model" class="send">Применить</button>
+            </div>
+          </section>
+          <section class="composer-popover context-popover" id="composer-context-panel" aria-label="Контекст модели" hidden>
+            <div class="section-label context-estimate">Оценка контекста</div>
+            <div id="composer-context"></div>
+            <details id="composer-context-details"><summary>Подробнее</summary><div id="context-agents"></div></details>
+          </section>
         </form>
         <div class="composer-note"><span>Shift + Enter · новая строка</span><span id="queue-status" role="status"></span></div>
         <p class="inline-error" id="inline-error" role="alert" hidden></p>
@@ -134,9 +177,6 @@
         <button class="icon-button" id="cancel-agent" type="button" aria-label="Закрыть настройки">×</button>
       </div>
       <div class="settings-fields">
-        <label>Модель <select name="model"></select></label>
-        <p class="settings-note" id="model-description"></p>
-        <label>Уровень рассуждения <select name="effort"></select></label>
         <label>Разрешения <select name="permission"></select></label>
         <p class="settings-note" id="permission-description"></p>
         <label class="full-warning" id="full-warning" hidden><input type="checkbox" name="confirmFull"> Подтверждаю полный доступ без песочницы и подтверждений</label>
@@ -145,6 +185,18 @@
       <p class="inline-error" id="agent-error" role="alert" hidden></p>
       <button class="send" type="submit" id="save-agent">Сохранить</button>
     </form>
+  </dialog>
+  <dialog id="prompts-dialog" aria-labelledby="prompts-title">
+    <div class="dialog-header">
+      <h2 id="prompts-title">Сохранённые промпты</h2>
+      <button class="icon-button" id="close-prompts" type="button" aria-label="Закрыть промпты">×</button>
+    </div>
+    <div id="prompt-list"></div>
+    <form id="prompt-form">
+      <label>Название <input name="title" maxlength="100" placeholder="Название промпта"></label>
+      <button class="send" type="submit" id="save-prompt">Сохранить текущий текст</button>
+    </form>
+    <p class="inline-error" id="prompt-error" role="alert" hidden></p>
   </dialog>
 </body>
 </html>
