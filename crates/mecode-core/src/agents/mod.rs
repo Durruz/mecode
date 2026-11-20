@@ -3,6 +3,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod info;
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -15,7 +16,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::model::AgentId;
+use crate::model::{AgentId, AgentSettings, Limits};
 
 /// Что агент сообщает во время хода.
 #[derive(Clone, Debug, PartialEq)]
@@ -29,6 +30,9 @@ pub enum AgentEvent {
     /// Действие: команда, правка файла, инструмент.
     Activity(String),
     Error(String),
+    /// Заполненность контекста; `None` = это поле не изменилось.
+    Context { used: Option<u64>, window: Option<u64> },
+    Limits(Limits),
 }
 
 /// Один ход агента.
@@ -42,6 +46,8 @@ pub struct TurnSpec {
     pub prompt: String,
     /// Правила группового чата.
     pub system: String,
+    /// Модель, рассуждение, разрешения.
+    pub settings: AgentSettings,
 }
 
 pub async fn run_turn(
@@ -57,7 +63,32 @@ pub async fn run_turn(
         }
         AgentId::Codex => {
             let (cmd, stdin) = codex::command(&cfg.codex, &spec);
-            run_jsonl(cmd, stdin, |v| codex::parse_line(&v), &tx, cancel).await
+            let session = std::sync::Mutex::new(spec.session.clone());
+            let res = run_jsonl(
+                cmd,
+                stdin,
+                |v| {
+                    let evs = codex::parse_line(&v);
+                    for ev in &evs {
+                        if let AgentEvent::Session(id) = ev {
+                            *session.lock().unwrap() = Some(id.clone());
+                        }
+                    }
+                    evs
+                },
+                &tx,
+                cancel,
+            )
+            .await;
+            // `codex exec --json` не сообщает контекст и лимиты, они есть в файле сессии.
+            if let Some(id) = session.into_inner().unwrap() {
+                if let Ok(evs) = tokio::task::spawn_blocking(move || codex::read_rollout_stats(&id)).await {
+                    for ev in evs {
+                        let _ = tx.send(ev);
+                    }
+                }
+            }
+            res
         }
     }
 }

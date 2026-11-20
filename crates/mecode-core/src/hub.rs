@@ -11,16 +11,18 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::agents::info::{self, ModelInfo};
 use crate::agents::{self, AgentEvent, TurnSpec};
 use crate::config::Config;
-use crate::model::{AgentId, Author, Event, Message, MessageKind, Room, Target};
+use crate::model::{AgentId, AgentSettings, Author, ContextUsage, Event, Limits, Message, MessageKind, Room, Target};
 use crate::router;
 use crate::store::Store;
 
@@ -54,10 +56,30 @@ impl RoomState {
     }
 }
 
+/// Список моделей обоих агентов (для `GET /api/models`).
+#[derive(Clone, Debug, Serialize)]
+pub struct Models {
+    pub claude: Vec<ModelInfo>,
+    pub codex: Vec<ModelInfo>,
+}
+
+/// Последние известные лимиты подписок.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AllLimits {
+    pub claude: Option<Limits>,
+    pub codex: Option<Limits>,
+}
+
+/// Сколько держать в памяти список моделей Codex.
+const MODELS_TTL: Duration = Duration::from_secs(600);
+
 pub struct Hub {
     cfg: Config,
+    data_dir: PathBuf,
     store: Store,
     rooms: Mutex<HashMap<String, RoomState>>,
+    limits: Mutex<AllLimits>,
+    models: tokio::sync::Mutex<Option<(Instant, Models)>>,
     tx: broadcast::Sender<Event>,
 }
 
@@ -65,18 +87,122 @@ impl Hub {
     pub fn new(cfg: Config, data_dir: &Path) -> anyhow::Result<Arc<Self>> {
         let store = Store::new(data_dir)?;
         let mut rooms = HashMap::new();
-        for (room, messages) in store.load_rooms()? {
+        for (mut room, messages) in store.load_rooms()? {
+            // Чаты из старых версий: дописываем настройки агентов по умолчанию.
+            for a in AgentId::ALL {
+                room.agents.entry(a).or_insert_with(|| cfg.agent(a).defaults());
+            }
             rooms.insert(
                 room.id.clone(),
                 RoomState { room, messages, running: HashMap::new(), pending: HashSet::new(), hops: 0 },
             );
         }
+        let limits = std::fs::read_to_string(data_dir.join("limits.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
         let (tx, _) = broadcast::channel(1024);
-        Ok(Arc::new(Self { cfg, store, rooms: Mutex::new(rooms), tx }))
+        Ok(Arc::new(Self {
+            cfg,
+            data_dir: data_dir.to_path_buf(),
+            store,
+            rooms: Mutex::new(rooms),
+            limits: Mutex::new(limits),
+            models: tokio::sync::Mutex::new(None),
+            tx,
+        }))
     }
 
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    /// Модели Claude (псевдонимы) и Codex (из `codex app-server`, кэш 10 минут).
+    pub async fn models(&self) -> Models {
+        let mut cache = self.models.lock().await;
+        if let Some((at, m)) = cache.as_ref() {
+            if at.elapsed() < MODELS_TTL {
+                return m.clone();
+            }
+        }
+        let codex = match info::codex_models(&self.cfg.codex.bin).await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!("список моделей Codex: {e:#}");
+                Vec::new()
+            }
+        };
+        let m = Models { claude: info::claude_models(), codex };
+        if !m.codex.is_empty() {
+            *cache = Some((Instant::now(), m.clone()));
+        }
+        m
+    }
+
+    pub fn limits(&self) -> AllLimits {
+        self.limits.lock().unwrap().clone()
+    }
+
+    fn set_limits(&self, agent: AgentId, l: Limits) {
+        let snapshot = {
+            let mut all = self.limits.lock().unwrap();
+            let slot = match agent {
+                AgentId::Claude => &mut all.claude,
+                AgentId::Codex => &mut all.codex,
+            };
+            // У Claude план приходит не в каждом событии — сохраняем известный.
+            let plan = l.plan.clone().or_else(|| slot.as_ref().and_then(|o| o.plan.clone()));
+            *slot = Some(Limits { plan, ..l });
+            all.clone()
+        };
+        if let Ok(s) = serde_json::to_string_pretty(&snapshot) {
+            let _ = std::fs::write(self.data_dir.join("limits.json"), s);
+        }
+        let limits = match agent {
+            AgentId::Claude => snapshot.claude,
+            AgentId::Codex => snapshot.codex,
+        };
+        if let Some(limits) = limits {
+            self.emit(Event::Limits { agent, limits });
+        }
+    }
+
+    /// Обновляет лимиты. Codex — бесплатно; Claude — только если `claude == true`
+    /// (это крошечный запрос к модели).
+    pub async fn refresh_limits(&self, claude: bool) -> AllLimits {
+        let probe_dir = self.data_dir.join("probe");
+        let _ = std::fs::create_dir_all(&probe_dir);
+        let (cx, cl) = tokio::join!(info::codex_limits(&self.cfg.codex.bin), async {
+            if !claude {
+                return None;
+            }
+            let (limits, plan) = tokio::join!(
+                info::claude_limits_probe(&self.cfg.claude.bin, &probe_dir),
+                info::claude_plan(&self.cfg.claude.bin)
+            );
+            Some(limits.map(|l| Limits { plan: plan.or(l.plan.clone()), ..l }))
+        });
+        match cx {
+            Ok(l) => self.set_limits(AgentId::Codex, l),
+            Err(e) => tracing::warn!("лимиты Codex: {e:#}"),
+        }
+        match cl {
+            Some(Ok(l)) => self.set_limits(AgentId::Claude, l),
+            Some(Err(e)) => tracing::warn!("лимиты Claude: {e:#}"),
+            None => {}
+        }
+        self.limits()
+    }
+
+    /// Меняет модель, рассуждение и разрешения агента в чате. Действует со следующего хода.
+    pub fn set_agent(&self, room_id: &str, agent: AgentId, settings: AgentSettings) -> anyhow::Result<Room> {
+        settings.validate()?;
+        let mut rooms = self.rooms.lock().unwrap();
+        let st = rooms.get_mut(room_id).context("комната не найдена")?;
+        st.room.agents.insert(agent, settings);
+        self.store.save_room(&st.room)?;
+        self.emit(Event::RoomUpdated { room: st.room.clone() });
+        Ok(st.room.clone())
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -121,6 +247,8 @@ impl Hub {
             default_target: Target::All,
             sessions: HashMap::new(),
             cursors: HashMap::new(),
+            agents: AgentId::ALL.iter().map(|a| (*a, self.cfg.agent(*a).defaults())).collect(),
+            context: HashMap::new(),
         };
         self.store.save_room(&room)?;
         let state = RoomState { room: room.clone(), messages: Vec::new(), running: HashMap::new(), pending: HashSet::new(), hops: 0 };
@@ -231,6 +359,7 @@ impl Hub {
             session: st.room.sessions.get(&agent).cloned(),
             prompt,
             system: system_prompt(agent),
+            settings: st.room.agents.get(&agent).cloned().unwrap_or_else(|| self.cfg.agent(agent).defaults()),
         };
         let token = CancellationToken::new();
         st.running.insert(agent, token.clone());
@@ -250,11 +379,19 @@ impl Hub {
 
         let mut said = String::new();
         let mut typing = String::new();
+        let mut context_changed = false;
         while let Some(ev) = erx.recv().await {
-            if let AgentEvent::Delta(chunk) = &ev {
-                typing.push_str(chunk);
-                self.emit(Event::Delta { room_id: room_id.clone(), agent, text: typing.clone() });
-                continue;
+            match ev {
+                AgentEvent::Delta(chunk) => {
+                    typing.push_str(&chunk);
+                    self.emit(Event::Delta { room_id: room_id.clone(), agent, text: typing.clone() });
+                    continue;
+                }
+                AgentEvent::Limits(l) => {
+                    self.set_limits(agent, l);
+                    continue;
+                }
+                _ => {}
             }
             let mut rooms = self.rooms.lock().unwrap();
             let Some(st) = rooms.get_mut(&room_id) else { break };
@@ -263,7 +400,17 @@ impl Hub {
                     st.room.sessions.insert(agent, id);
                     let _ = self.store.save_room(&st.room);
                 }
-                AgentEvent::Delta(_) => {}
+                AgentEvent::Delta(_) | AgentEvent::Limits(_) => {}
+                AgentEvent::Context { used, window } => {
+                    let c = st.room.context.entry(agent).or_insert(ContextUsage::default());
+                    if let Some(u) = used {
+                        c.used = u;
+                    }
+                    if window.is_some() {
+                        c.window = window;
+                    }
+                    context_changed = true;
+                }
                 AgentEvent::Text(t) => {
                     typing.clear();
                     said.push_str(&t);
@@ -284,15 +431,18 @@ impl Hub {
             Ok(Err(e)) => Some(format!("{e:#}")),
             Err(e) => Some(format!("сбой задачи: {e}")),
         };
-        self.finish(&room_id, agent, &said, failure, token.is_cancelled());
+        self.finish(&room_id, agent, &said, failure, token.is_cancelled(), context_changed);
     }
 
-    fn finish(self: &Arc<Self>, room_id: &str, agent: AgentId, said: &str, failure: Option<String>, cancelled: bool) {
+    fn finish(self: &Arc<Self>, room_id: &str, agent: AgentId, said: &str, failure: Option<String>, cancelled: bool, context_changed: bool) {
         let mut rooms = self.rooms.lock().unwrap();
         let Some(st) = rooms.get_mut(room_id) else { return };
         st.running.remove(&agent);
         if let Err(e) = self.store.save_room(&st.room) {
             tracing::error!("не удалось сохранить комнату: {e}");
+        }
+        if context_changed {
+            self.emit(Event::RoomUpdated { room: st.room.clone() });
         }
         if let Some(f) = failure {
             self.push(st, agent.into(), MessageKind::Error, f);

@@ -99,6 +99,66 @@ pub enum Target {
     Codex,
 }
 
+/// Что агенту разрешено делать.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Permission {
+    /// Только чтение.
+    Read,
+    /// Правит внутри папки проекта, остальное запрещено.
+    #[default]
+    Edits,
+    /// Та же песочница, запросы за её пределы проверяются автоматически.
+    Auto,
+    /// Без песочницы и подтверждений.
+    Full,
+}
+
+/// Настройки агента в конкретном чате.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AgentSettings {
+    /// "" = модель по умолчанию.
+    pub model: String,
+    /// "" = уровень рассуждения по умолчанию.
+    pub effort: String,
+    pub permission: Permission,
+}
+
+impl AgentSettings {
+    /// Значения попадают в аргументы CLI, поэтому пропускаем только безопасные символы.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let ok = |s: &str, extra: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(c));
+        anyhow::ensure!(self.model.len() <= 100 && ok(&self.model, "._:-[]/"), "недопустимое имя модели");
+        anyhow::ensure!(self.effort.len() <= 20 && ok(&self.effort, "_-"), "недопустимый уровень рассуждения");
+        Ok(())
+    }
+}
+
+/// Заполненность контекста агента в чате.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ContextUsage {
+    pub used: u64,
+    pub window: Option<u64>,
+}
+
+/// Окно лимита подписки (5 часов, 7 дней).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LimitWindow {
+    /// "5h" | "7d"
+    pub id: String,
+    pub used_percent: f64,
+    /// Unix-время сброса, секунды.
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Limits {
+    pub plan: Option<String>,
+    pub windows: Vec<LimitWindow>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Комната (чат) с рабочей папкой проекта.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Room {
@@ -114,6 +174,12 @@ pub struct Room {
     /// Последнее сообщение, которое агент уже видел.
     #[serde(default)]
     pub cursors: HashMap<AgentId, u64>,
+    /// Модель, рассуждение и разрешения каждого агента.
+    #[serde(default)]
+    pub agents: HashMap<AgentId, AgentSettings>,
+    /// Сколько контекста занято у каждого агента (по последнему ходу).
+    #[serde(default)]
+    pub context: HashMap<AgentId, ContextUsage>,
 }
 
 /// События для интерфейса (уходят по WebSocket).
@@ -126,4 +192,5 @@ pub enum Event {
     RoomDeleted { room_id: String },
     /// Текст, который агент печатает прямо сейчас (накопленный целиком). Не сохраняется.
     Delta { room_id: String, agent: AgentId, text: String },
+    Limits { agent: AgentId, limits: Limits },
 }

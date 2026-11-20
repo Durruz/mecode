@@ -20,7 +20,31 @@ interface Room {
   cursors:  Partial<Record<AgentId, number>>;  // служебное
 }
 interface RoomView extends Room { busy: AgentId[] }   // кто сейчас работает
+
+// Дополнительные поля Room:
+//   agents:  Record<AgentId, AgentSettings>          — всегда есть оба
+//   context: Partial<Record<AgentId, ContextUsage>>  — появляется после первого хода агента
+type Permission = "read" | "edits" | "auto" | "full";
+interface AgentSettings { model: string /* "" = по умолчанию */; effort: string /* "" = по умолчанию */; permission: Permission }
+interface ContextUsage { used: number; window: number | null }
+
+interface ModelInfo { id: string /* "" = по умолчанию */; name: string; description: string;
+                      efforts: string[]; default_effort: string | null; is_default: boolean }
+interface Limits { plan: string | null /* "pro", "plus"… */;
+                   windows: { id: "5h" | "7d"; used_percent: number; resets_at: number | null /* unix сек */ }[];
+                   updated_at: string }
 ```
+
+### Что значат разрешения
+
+| permission | Claude Code | Codex |
+|---|---|---|
+| `read` | `dontAsk`: читает, всё остальное молча отклоняется | песочница `read-only` |
+| `edits` | `acceptEdits`: правки файлов в папке проекта принимаются, команды и файлы вне папки отклоняются. Песочницы ОС нет | песочница ОС `workspace-write`: запись только в папку проекта |
+| `auto` | `auto`: решения принимает классификатор Claude Code, может выйти за папку | `workspace-write` + автопроверка запросов (`approvals_reviewer=auto_review`) |
+| `full` | `bypassPermissions`: без ограничений | без песочницы и подтверждений |
+
+Режим `plan` у Claude не используется: в нём Claude Code подменяет выбранную модель на Sonnet.
 
 ## REST (JSON, `Content-Type: application/json`)
 
@@ -37,7 +61,14 @@ interface RoomView extends Room { busy: AgentId[] }   // кто сейчас р�
 | POST | `/api/rooms/{id}/stop` | — | `{ok}` — остановить всех агентов комнаты |
 | PUT | `/api/rooms/{id}/target` | `{target}` | `{ok}` |
 
+| PUT | `/api/rooms/{id}/agents/{claude\|codex}` | `AgentSettings` | `Room` — действует со следующего хода агента |
+| GET | `/api/models` | — | `{claude: ModelInfo[], codex: ModelInfo[]}`. Claude — псевдонимы (всегда последние версии), Codex — из `codex app-server`, кэш 10 мин |
+| GET | `/api/limits` | — | `{claude: Limits\|null, codex: Limits\|null}` — последние известные, хранятся между запусками |
+| POST | `/api/limits/refresh` | — | то же, свежее. Для Claude делает крошечный запрос к Haiku (тратит каплю лимита) — только по кнопке. `?claude=false` — только Codex, бесплатно, можно раз в минуту |
+
 Ошибка: HTTP 400 `{error: string}`.
+
+Лимиты также обновляются сами после каждого хода агента (событие `limits`), а контекст — через `room_updated`.
 
 ## События: WebSocket `ws://127.0.0.1:7878/api/events`
 
@@ -49,6 +80,7 @@ interface RoomView extends Room { busy: AgentId[] }   // кто сейчас р�
 { type: "room_updated", room: Room }
 { type: "room_deleted", room_id: string }
 { type: "delta",        room_id: string, agent: AgentId, text: string }
+{ type: "limits",       agent: AgentId, limits: Limits }
 { type: "resync" }   // клиент отстал — перечитать комнаты/сообщения через REST
 ```
 

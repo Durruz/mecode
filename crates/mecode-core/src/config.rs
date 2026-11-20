@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::{AgentId, AgentSettings, Permission};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -9,8 +11,8 @@ pub struct Config {
     pub port: u16,
     /// Сколько раз подряд агенты могут будить друг друга без участия пользователя.
     pub max_agent_hops: u32,
-    pub claude: ClaudeConfig,
-    pub codex: CodexConfig,
+    pub claude: AgentConfig,
+    pub codex: AgentConfig,
 }
 
 impl Default for Config {
@@ -18,62 +20,66 @@ impl Default for Config {
         Self {
             port: 7878,
             max_agent_hops: 8,
-            claude: ClaudeConfig::default(),
-            codex: CodexConfig::default(),
+            claude: AgentConfig::new("claude"),
+            codex: AgentConfig::new("codex"),
         }
     }
 }
 
+/// Настройки агента. `model`, `effort`, `permission` — значения по умолчанию для новых чатов.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
-pub struct ClaudeConfig {
+pub struct AgentConfig {
     pub bin: String,
-    /// Пусто = модель по умолчанию из настроек Claude Code.
     pub model: String,
-    /// default | acceptEdits | plan | bypassPermissions
-    pub permission_mode: String,
+    pub effort: String,
+    pub permission: Permission,
     pub extra_args: Vec<String>,
 }
 
-impl Default for ClaudeConfig {
+impl Default for AgentConfig {
     fn default() -> Self {
-        Self {
-            bin: "claude".into(),
-            model: String::new(),
-            permission_mode: "acceptEdits".into(),
-            extra_args: Vec::new(),
-        }
+        Self::new("")
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CodexConfig {
-    pub bin: String,
-    pub model: String,
-    /// read-only | workspace-write | danger-full-access
-    pub sandbox: String,
-    pub extra_args: Vec<String>,
-}
-
-impl Default for CodexConfig {
-    fn default() -> Self {
+impl AgentConfig {
+    fn new(bin: &str) -> Self {
         Self {
-            bin: "codex".into(),
+            bin: bin.into(),
             model: String::new(),
-            sandbox: "workspace-write".into(),
+            effort: String::new(),
+            permission: Permission::Edits,
             extra_args: Vec::new(),
         }
+    }
+
+    pub fn defaults(&self) -> AgentSettings {
+        AgentSettings { model: self.model.clone(), effort: self.effort.clone(), permission: self.permission }
     }
 }
 
 impl Config {
+    pub fn agent(&self, agent: AgentId) -> &AgentConfig {
+        match agent {
+            AgentId::Claude => &self.claude,
+            AgentId::Codex => &self.codex,
+        }
+    }
+
     /// Читает `config.json` из папки данных; если файла нет, создаёт его с настройками по умолчанию.
     pub fn load_or_create(data_dir: &Path) -> anyhow::Result<Self> {
         let path = Self::path(data_dir);
         if path.exists() {
             let raw = std::fs::read_to_string(&path)?;
-            Ok(serde_json::from_str(&raw)?)
+            let mut cfg: Config = serde_json::from_str(&raw)?;
+            if cfg.claude.bin.is_empty() {
+                cfg.claude.bin = "claude".into();
+            }
+            if cfg.codex.bin.is_empty() {
+                cfg.codex.bin = "codex".into();
+            }
+            Ok(cfg)
         } else {
             let cfg = Config::default();
             std::fs::create_dir_all(data_dir)?;

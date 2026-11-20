@@ -3,19 +3,35 @@
 use serde_json::Value;
 use tokio::process::Command;
 
-use super::{AgentEvent, TurnSpec, clip};
-use crate::config::ClaudeConfig;
+use chrono::Utc;
 
-pub fn command(cfg: &ClaudeConfig, spec: &TurnSpec) -> (Command, String) {
+use super::{AgentEvent, TurnSpec, clip};
+use crate::config::AgentConfig;
+use crate::model::{LimitWindow, Limits, Permission};
+
+pub fn permission_mode(p: Permission) -> &'static str {
+    match p {
+        // Не `plan`: в нём Claude Code подменяет выбранную модель на Sonnet.
+        // `dontAsk` разрешает чтение и молча отклоняет всё, что требует разрешения.
+        Permission::Read => "dontAsk",
+        Permission::Edits => "acceptEdits",
+        Permission::Auto => "auto",
+        Permission::Full => "bypassPermissions",
+    }
+}
+
+pub fn command(cfg: &AgentConfig, spec: &TurnSpec) -> (Command, String) {
+    let s = &spec.settings;
     let mut cmd = Command::new(&cfg.bin);
     cmd.current_dir(&spec.workspace)
         .args(["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"])
-        .args(["--append-system-prompt", &spec.system]);
-    if !cfg.permission_mode.is_empty() {
-        cmd.args(["--permission-mode", &cfg.permission_mode]);
+        .args(["--append-system-prompt", &spec.system])
+        .args(["--permission-mode", permission_mode(s.permission)]);
+    if !s.model.is_empty() {
+        cmd.args(["--model", &s.model]);
     }
-    if !cfg.model.is_empty() {
-        cmd.args(["--model", &cfg.model]);
+    if !s.effort.is_empty() {
+        cmd.args(["--effort", &s.effort]);
     }
     if let Some(s) = &spec.session {
         cmd.args(["--resume", s]);
@@ -40,7 +56,23 @@ pub fn parse_line(v: &Value) -> Vec<AgentEvent> {
                 }
             }
         }
+        Some("rate_limit_event") => {
+            if let Some(l) = parse_limits(&v["rate_limit_info"]) {
+                out.push(AgentEvent::Limits(l));
+            }
+        }
         Some("assistant") => {
+            // Размер контекста = всё, что ушло на вход последнего запроса к модели.
+            let u = &v["message"]["usage"];
+            if u.is_object() {
+                let used = ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"]
+                    .iter()
+                    .filter_map(|k| u[*k].as_u64())
+                    .sum::<u64>();
+                if used > 0 {
+                    out.push(AgentEvent::Context { used: Some(used), window: None });
+                }
+            }
             for block in v["message"]["content"].as_array().into_iter().flatten() {
                 match block["type"].as_str() {
                     Some("text") => {
@@ -55,6 +87,12 @@ pub fn parse_line(v: &Value) -> Vec<AgentEvent> {
             }
         }
         Some("result") => {
+            let window = v["modelUsage"]
+                .as_object()
+                .and_then(|m| m.values().filter_map(|x| x["contextWindow"].as_u64()).max());
+            if window.is_some() {
+                out.push(AgentEvent::Context { used: None, window });
+            }
             if v["is_error"].as_bool() == Some(true) {
                 let msg = v["result"].as_str().unwrap_or("ошибка Claude");
                 out.push(AgentEvent::Error(msg.to_string()));
@@ -63,6 +101,23 @@ pub fn parse_line(v: &Value) -> Vec<AgentEvent> {
         _ => {}
     }
     out
+}
+
+/// `rate_limit_info.unifiedWindows` → окна 5h/7d (utilization — доля от 0 до 1).
+pub fn parse_limits(info: &Value) -> Option<Limits> {
+    let w = info["unifiedWindows"].as_object()?;
+    let windows: Vec<LimitWindow> = [("five_hour", "5h"), ("seven_day", "7d")]
+        .iter()
+        .filter_map(|(key, id)| {
+            let x = w.get(*key)?;
+            Some(LimitWindow {
+                id: (*id).into(),
+                used_percent: (x["utilization"].as_f64()? * 1000.0).round() / 10.0,
+                resets_at: x["resetsAt"].as_i64(),
+            })
+        })
+        .collect();
+    (!windows.is_empty()).then(|| Limits { plan: None, windows, updated_at: Utc::now() })
 }
 
 fn tool_summary(block: &Value) -> String {
@@ -106,6 +161,22 @@ mod tests {
         assert_eq!(parse_line(&d), vec![AgentEvent::Delta("од".into())]);
         let th = json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hm"}}});
         assert!(parse_line(&th).is_empty());
+    }
+
+    #[test]
+    fn parses_context_and_limits() {
+        let a = json!({"type":"assistant","message":{"usage":{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":900},"content":[]}});
+        assert_eq!(parse_line(&a), vec![AgentEvent::Context { used: Some(1002), window: None }]);
+        let r = json!({"type":"result","modelUsage":{"claude-haiku-5-5":{"contextWindow":1000000}}});
+        assert_eq!(parse_line(&r), vec![AgentEvent::Context { used: None, window: Some(1_000_000) }]);
+        let l = json!({"type":"rate_limit_event","rate_limit_info":{"unifiedWindows":{
+            "five_hour":{"utilization":0.33,"resetsAt":1795193400},"seven_day":{"utilization":0.375,"resetsAt":1795582800}}}});
+        let evs = parse_line(&l);
+        let [AgentEvent::Limits(lim)] = evs.as_slice() else { panic!("{evs:?}") };
+        assert_eq!(lim.windows[0].id, "5h");
+        assert_eq!(lim.windows[0].used_percent, 33.0);
+        assert_eq!(lim.windows[1].used_percent, 37.5);
+        assert_eq!(lim.windows[1].resets_at, Some(1795582800));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use mecode_core::{Hub, Target};
+use mecode_core::{AgentId, AgentSettings, Hub, Target};
 use serde::Deserialize;
 use serde_json::json;
 use tower_http::cors::CorsLayer;
@@ -41,6 +41,10 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/rooms/{id}/messages", get(messages).post(send))
         .route("/api/rooms/{id}/stop", post(stop))
         .route("/api/rooms/{id}/target", put(set_target))
+        .route("/api/rooms/{id}/agents/{agent}", put(set_agent))
+        .route("/api/models", get(models))
+        .route("/api/limits", get(limits))
+        .route("/api/limits/refresh", post(refresh_limits))
         .route("/api/events", get(events))
         .layer(middleware::from_fn(guard))
         .layer(cors)
@@ -170,6 +174,40 @@ struct SetTarget {
 async fn set_target(State(hub): State<Arc<Hub>>, Path(id): Path<String>, Json(body): Json<SetTarget>) -> ApiResult<serde_json::Value> {
     hub.set_target(&id, body.target)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+async fn set_agent(
+    State(hub): State<Arc<Hub>>,
+    Path((id, agent)): Path<(String, AgentId)>,
+    Json(body): Json<AgentSettings>,
+) -> ApiResult<mecode_core::Room> {
+    Ok(Json(hub.set_agent(&id, agent, body)?))
+}
+
+async fn models(State(hub): State<Arc<Hub>>) -> Json<mecode_core::hub::Models> {
+    Json(hub.models().await)
+}
+
+async fn limits(State(hub): State<Arc<Hub>>) -> Json<mecode_core::hub::AllLimits> {
+    Json(hub.limits())
+}
+
+#[derive(Deserialize)]
+struct RefreshQuery {
+    /// `?claude=false` — обновить только Codex (бесплатно, можно по таймеру).
+    #[serde(default = "yes")]
+    claude: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+async fn refresh_limits(
+    State(hub): State<Arc<Hub>>,
+    axum::extract::Query(q): axum::extract::Query<RefreshQuery>,
+) -> Json<mecode_core::hub::AllLimits> {
+    Json(hub.refresh_limits(q.claude).await)
 }
 
 async fn events(State(hub): State<Arc<Hub>>, ws: WebSocketUpgrade) -> Response {
