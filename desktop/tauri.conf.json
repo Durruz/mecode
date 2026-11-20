@@ -1,0 +1,23 @@
+{
+  "productName": "Mecode",
+  "version": "0.1.0",
+  "identifier": "dev.mecode.desktop",
+  "build": { "frontendDist": "./ui" },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Mecode",
+        "create": false,
+        "width": 1440,
+        "height": 900,
+        "minWidth": 640,
+        "minHeight": 540
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* ws://127.0.0.1:*"
+    }
+  },
+  "bundle": { "active": false }
+}

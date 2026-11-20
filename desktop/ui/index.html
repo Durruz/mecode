@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mecode</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="vendor/markdown-it.min.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <button class="icon-button navigation-toggle" id="navigation-toggle" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="Чаты">☰</button>
+    <div class="brand"><span class="brand-mark" aria-hidden="true">M</span>Mecode</div>
+    <span class="top-divider"></span>
+    <span class="project-name"><span class="folder-icon" aria-hidden="true"></span><span id="project-name">Рабочая папка</span></span>
+    <div class="top-actions">
+      <span class="connection-label" id="connection" role="status"><span class="status-dot"></span><span id="connection-text">Подключение…</span></span>
+      <button class="icon-button panel-toggle" type="button" aria-controls="inspector" aria-expanded="false" aria-label="Открыть контекст" title="Контекст">◫</button>
+    </div>
+  </header>
+
+  <div class="shell">
+    <aside class="sidebar" id="sidebar" aria-label="Чаты проекта">
+      <button type="button" class="new-room" id="new-room"><span aria-hidden="true">＋</span> Новый чат</button>
+      <h2 class="section-label">Чаты проекта</h2>
+      <nav id="room-list" class="room-list" aria-label="Список чатов"></nav>
+      <div class="side-bottom">
+        <span class="folder-icon" aria-hidden="true"></span>
+        <div><strong>Рабочая папка</strong><small id="workspace-path">Выберите чат</small></div>
+      </div>
+    </aside>
+
+    <main class="conversation" aria-labelledby="room-title">
+      <header class="conversation-header">
+        <div class="heading-group">
+          <h1 id="room-title"></h1>
+          <div class="participants" aria-label="Участники чата">
+            <span class="participant"><span class="agent-dot claude"></span>Claude</span>
+            <span class="participant"><span class="agent-dot codex"></span>Codex</span>
+            <span class="participant-caption">Общая история</span>
+          </div>
+        </div>
+        <div class="header-actions">
+          <div class="room-actions" id="room-actions" hidden>
+            <button class="icon-button" id="room-actions-toggle" type="button" aria-controls="room-action-list" aria-expanded="false" aria-label="Действия с чатом">···</button>
+            <div class="room-action-list" id="room-action-list" hidden>
+              <button type="button" id="rename-room">Переименовать</button>
+              <button type="button" id="delete-room">Удалить чат</button>
+            </div>
+          </div>
+          <button class="context-button panel-toggle" type="button" aria-controls="inspector" aria-expanded="false"><span aria-hidden="true">◫</span> Контекст</button>
+        </div>
+      </header>
+
+      <div class="feed-scroll" id="feed-scroll">
+        <div class="feed" id="feed" role="log" aria-label="История чата" aria-live="polite"></div>
+        <div class="live-drafts feed" id="live-drafts"></div>
+      </div>
+
+      <div class="composer-area">
+        <form class="composer" id="composer">
+          <div class="mention-list" id="mention-list" role="listbox" aria-label="Упоминания" hidden></div>
+          <textarea id="draft" rows="2" aria-label="Сообщение" placeholder="Напишите задачу. @ — выбрать агента" aria-autocomplete="list" aria-controls="mention-list"></textarea>
+          <div class="composer-footer">
+            <fieldset class="targets">
+              <legend class="sr-only">Адресат сообщения</legend>
+              <label><input type="radio" name="target" value="all" checked><span>Обоим</span></label>
+              <label><input type="radio" name="target" value="claude"><span><i class="agent-dot claude"></i>Claude</span></label>
+              <label><input type="radio" name="target" value="codex"><span><i class="agent-dot codex"></i>Codex</span></label>
+            </fieldset>
+            <div class="message-actions">
+              <button class="stop" type="button" id="stop" aria-label="Стоп" hidden>■ <span>Стоп</span></button>
+              <button class="send" type="submit" id="send" aria-label="Отправить" disabled><span>Отправить</span><b aria-hidden="true">↑</b></button>
+            </div>
+          </div>
+        </form>
+        <div class="composer-note"><span>Shift + Enter · новая строка</span><span id="queue-status" role="status"></span></div>
+        <p class="inline-error" id="inline-error" role="alert" hidden></p>
+      </div>
+    </main>
+
+    <aside class="inspector" id="inspector" aria-label="Контекст задачи">
+      <div class="inspector-header">
+        <h2>Контекст</h2>
+        <button class="icon-button panel-close" type="button" aria-label="Закрыть контекст">×</button>
+      </div>
+      <div class="inspector-body">
+        <h3 class="section-label">Агенты</h3>
+        <div class="agent-list" id="agent-list"></div>
+        <div class="panel-tabs" role="group" aria-label="Раздел контекста">
+          <button type="button" data-panel="activity" aria-pressed="true">Активность</button>
+          <button type="button" data-panel="workspace" aria-pressed="false">Папка</button>
+        </div>
+        <div class="panel-content" id="panel-content"></div>
+      </div>
+    </aside>
+  </div>
+  <dialog id="room-dialog" aria-labelledby="room-dialog-title">
+    <form id="room-form">
+      <div class="dialog-header">
+        <h2 id="room-dialog-title">Новый чат</h2>
+        <button class="icon-button" id="cancel-room" type="button" aria-label="Закрыть">×</button>
+      </div>
+      <label>Название <input name="title" autocomplete="off" maxlength="100" placeholder="Например, Разбор проекта"></label>
+      <div class="workspace-field" id="workspace-field">
+        <label>Рабочая папка <input name="workspace" required autocomplete="off" placeholder="D:\Projects\my-app"></label>
+        <button class="icon-button" type="button" id="pick-folder">Обзор…</button>
+      </div>
+      <p id="delete-warning" hidden>История чата будет удалена. Работа агентов в этом чате остановится.</p>
+      <p class="inline-error" id="room-error" role="alert" hidden></p>
+      <button class="send" type="submit" id="create-room">Создать чат</button>
+    </form>
+  </dialog>
+</body>
+</html>

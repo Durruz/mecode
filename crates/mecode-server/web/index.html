@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mecode</title>
+<style>
+:root{--bg:#1b1a19;--panel:#242321;--line:#34322f;--text:#e9e5df;--muted:#9a948b;--user:#e8b096;--claude:#d97757;--codex:#7aa2f7;--err:#f7768e}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,sans-serif;display:flex;height:100vh}
+aside{width:260px;border-right:1px solid var(--line);padding:12px;display:flex;flex-direction:column;gap:8px;overflow:auto}
+main{flex:1;display:flex;flex-direction:column;min-width:0}
+button,input,select,textarea{font:inherit;color:inherit;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:6px 10px}
+button{cursor:pointer}.room{padding:8px;border-radius:6px;cursor:pointer}.room.active{background:var(--panel)}
+#log{flex:1;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:10px}
+.m{max-width:900px}.m .who{font-weight:600;font-size:12px}.m .t{white-space:pre-wrap;word-wrap:break-word}
+.user .who{color:var(--user)}.claude .who{color:var(--claude)}.codex .who{color:var(--codex)}.system .who{color:var(--muted)}
+.activity{color:var(--muted);font:12px ui-monospace,monospace}.error .t{color:var(--err)}
+footer{border-top:1px solid var(--line);padding:10px;display:flex;gap:8px;align-items:flex-end}
+textarea{flex:1;resize:none;min-height:44px;max-height:200px}#status{color:var(--muted);font-size:12px;padding:0 16px 6px}
+</style>
+</head>
+<body>
+<aside>
+  <b>Mecode</b>
+  <input id="ws" placeholder="Папка проекта, напр. D:\proj">
+  <button id="new">+ Новый чат</button>
+  <div id="rooms"></div>
+  <div id="health" style="color:var(--muted);font-size:12px;margin-top:auto"></div>
+</aside>
+<main>
+  <div id="log"></div>
+  <div id="status"></div>
+  <footer>
+    <select id="target"><option value="all">Всем</option><option value="claude">Claude</option><option value="codex">Codex</option></select>
+    <textarea id="text" placeholder="Сообщение… @claude / @codex / @all. Enter — отправить, Shift+Enter — перенос"></textarea>
+    <button id="send">Отправить</button><button id="stop">Стоп</button>
+  </footer>
+</main>
+<script>
+const $=s=>document.querySelector(s);let rooms=[],cur=null;
+const api=async(p,o={})=>{const r=await fetch(p,{...o,headers:{'Content-Type':'application/json'}});const j=await r.json();if(!r.ok)throw new Error(j.error);return j};
+const names={user:'Вы',claude:'Claude',codex:'Codex',system:'Система'};
+function render(m){const d=document.createElement('div');d.className=`m ${m.author} ${m.kind}`;
+ if(m.kind==='activity'){d.textContent=`${names[m.author]} · ${m.text}`}else{d.innerHTML='<div class="who"></div><div class="t"></div>';d.querySelector('.who').textContent=names[m.author];d.querySelector('.t').textContent=m.text}
+ const log=$('#log'),stick=log.scrollTop+log.clientHeight>=log.scrollHeight-40;log.appendChild(d);if(stick)log.scrollTop=log.scrollHeight}
+function drawRooms(){$('#rooms').innerHTML='';for(const r of rooms){const d=document.createElement('div');d.className='room'+(cur&&r.id===cur.id?' active':'');d.textContent=r.title+(r.busy?.length?' ●':'');d.title=r.workspace;d.onclick=()=>open(r.id);$('#rooms').appendChild(d)}}
+function drawStatus(){const r=rooms.find(x=>cur&&x.id===cur.id);$('#status').textContent=r?.busy?.length?r.busy.map(a=>names[a]).join(', ')+' работает…':''}
+async function loadRooms(){rooms=await api('/api/rooms');drawRooms();drawStatus()}
+async function open(id){cur=rooms.find(r=>r.id===id);$('#target').value=cur.default_target;$('#log').innerHTML='';(await api(`/api/rooms/${id}/messages`)).forEach(render);drawRooms();drawStatus()}
+$('#new').onclick=async()=>{try{const r=await api('/api/rooms',{method:'POST',body:JSON.stringify({workspace:$('#ws').value})});await loadRooms();open(r.id)}catch(e){alert(e.message)}};
+async function send(){const t=$('#text').value.trim();if(!t||!cur)return;$('#text').value='';try{await api(`/api/rooms/${cur.id}/messages`,{method:'POST',body:JSON.stringify({text:t})})}catch(e){alert(e.message)}}
+$('#send').onclick=send;$('#text').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}};
+$('#stop').onclick=()=>cur&&api(`/api/rooms/${cur.id}/stop`,{method:'POST'});
+$('#target').onchange=()=>cur&&api(`/api/rooms/${cur.id}/target`,{method:'PUT',body:JSON.stringify({target:$('#target').value})});
+function connect(){const ws=new WebSocket(`ws://${location.host}/api/events`);
+ ws.onmessage=e=>{const ev=JSON.parse(e.data);
+  if(ev.type==='delta'){if(cur&&ev.room_id===cur.id){let d=document.getElementById('typing-'+ev.agent);if(!d){d=document.createElement('div');d.id='typing-'+ev.agent;d.className='m '+ev.agent;d.innerHTML='<div class="who"></div><div class="t"></div>';d.querySelector('.who').textContent=names[ev.agent]+' печатает…';$('#log').appendChild(d)}d.querySelector('.t').textContent=ev.text;$('#log').scrollTop=$('#log').scrollHeight}return}
+  if(ev.type==='message'||(ev.type==='agent_status'&&!ev.busy)){const a=ev.message?.author||ev.agent;if(ev.type!=='message'||ev.message.kind==='chat')document.getElementById('typing-'+a)?.remove()}
+  if(ev.type==='room_deleted'){if(cur&&cur.id===ev.room_id){cur=null;$('#log').innerHTML=''}loadRooms();return}
+  if(ev.type==='message'&&cur&&ev.room_id===cur.id)render(ev.message);
+  else if(ev.type==='agent_status'){const r=rooms.find(x=>x.id===ev.room_id);if(r){r.busy=(r.busy||[]).filter(a=>a!==ev.agent);if(ev.busy)r.busy.push(ev.agent)}drawRooms();drawStatus()}
+  else if(ev.type==='room_updated'||ev.type==='resync')loadRooms()};
+ ws.onclose=()=>setTimeout(connect,1000)}
+api('/api/health').then(h=>$('#health').textContent=`claude: ${h.claude||'не найден'}\ncodex: ${h.codex||'не найден'}`);
+loadRooms().then(()=>rooms[0]&&open(rooms[0].id));connect();
+</script>
+</body>
+</html>
