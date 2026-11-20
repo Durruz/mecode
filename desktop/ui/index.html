@@ -11,11 +11,9 @@
 <body>
   <header class="topbar">
     <button class="icon-button navigation-toggle" id="navigation-toggle" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="Чаты">☰</button>
-    <div class="brand"><span class="brand-mark" aria-hidden="true">M</span>Mecode</div>
-    <span class="top-divider"></span>
-    <span class="project-name"><span class="folder-icon" aria-hidden="true"></span><span id="project-name">Рабочая папка</span></span>
+    <div class="brand"><span class="brand-mark" aria-hidden="true">&gt;_</span>Mecode</div>
+    <button class="project-name" id="change-workspace" type="button" title="Новый чат в другой папке" aria-label="Выбрать папку проекта" disabled><span class="folder-icon" aria-hidden="true"></span><span id="project-name">Выбрать папку</span><span aria-hidden="true">▾</span></button>
     <div class="top-actions">
-      <span class="connection-label" id="connection" role="status"><span class="status-dot"></span><span id="connection-text">Подключение…</span></span>
       <button class="icon-button panel-toggle" type="button" aria-controls="inspector" aria-expanded="false" aria-label="Открыть контекст" title="Контекст">◫</button>
     </div>
   </header>
@@ -62,6 +60,10 @@
         <form class="composer" id="composer">
           <div class="mention-list" id="mention-list" role="listbox" aria-label="Упоминания" hidden></div>
           <textarea id="draft" rows="2" aria-label="Сообщение" placeholder="Напишите задачу. @ — выбрать агента" aria-autocomplete="list" aria-controls="mention-list"></textarea>
+          <div class="composer-agents" aria-label="Настройки агентов">
+            <button class="agent-control claude" type="button" data-agent-settings="claude" aria-controls="agent-dialog" aria-label="Настройки Claude"><span class="agent-dot claude"></span><strong>Claude</strong><span class="agent-config">По умолчанию</span><span aria-hidden="true">▾</span></button>
+            <button class="agent-control codex" type="button" data-agent-settings="codex" aria-controls="agent-dialog" aria-label="Настройки Codex"><span class="agent-dot codex"></span><strong>Codex</strong><span class="agent-config">По умолчанию</span><span aria-hidden="true">▾</span></button>
+          </div>
           <div class="composer-footer">
             <fieldset class="targets">
               <legend class="sr-only">Адресат сообщения</legend>
@@ -90,12 +92,24 @@
         <div class="agent-list" id="agent-list"></div>
         <div class="panel-tabs" role="group" aria-label="Раздел контекста">
           <button type="button" data-panel="activity" aria-pressed="true">Активность</button>
+          <button type="button" data-panel="limits" aria-pressed="false">Лимиты</button>
           <button type="button" data-panel="workspace" aria-pressed="false">Папка</button>
         </div>
+        <div class="limits-toolbar" id="limits-toolbar" hidden>
+          <button class="icon-button" id="refresh-limits" type="button">↻ Обновить</button>
+          <span class="settings-note" id="limits-hint">Проверка Claude расходует немного лимита.</span>
+        </div>
+        <p class="inline-error" id="limits-error" role="alert" hidden></p>
         <div class="panel-content" id="panel-content"></div>
       </div>
     </aside>
   </div>
+  <footer class="statusbar" aria-label="Состояние Mecode">
+    <span class="connection-label" id="connection" role="status"><span class="status-dot"></span><span id="connection-text">Подключение…</span></span>
+    <span class="status-context claude"><i class="agent-dot claude"></i> Claude <span id="status-claude">—</span></span>
+    <span class="status-context codex"><i class="agent-dot codex"></i> Codex <span id="status-codex">—</span></span>
+    <button type="button" id="open-limits" aria-controls="inspector">Лимиты <span id="status-limits"></span> ↗</button>
+  </footer>
   <dialog id="room-dialog" aria-labelledby="room-dialog-title">
     <form id="room-form">
       <div class="dialog-header">
@@ -107,9 +121,29 @@
         <label>Рабочая папка <input name="workspace" required autocomplete="off" placeholder="D:\Projects\my-app"></label>
         <button class="icon-button" type="button" id="pick-folder">Обзор…</button>
       </div>
+      <p class="settings-note" id="workspace-note" hidden>В выбранной папке откроется новый чат.</p>
       <p id="delete-warning" hidden>История чата будет удалена. Работа агентов в этом чате остановится.</p>
       <p class="inline-error" id="room-error" role="alert" hidden></p>
       <button class="send" type="submit" id="create-room">Создать чат</button>
+    </form>
+  </dialog>
+  <dialog id="agent-dialog" aria-labelledby="agent-dialog-title">
+    <form id="agent-form">
+      <div class="dialog-header">
+        <h2 id="agent-dialog-title">Настройки агента</h2>
+        <button class="icon-button" id="cancel-agent" type="button" aria-label="Закрыть настройки">×</button>
+      </div>
+      <div class="settings-fields">
+        <label>Модель <select name="model"></select></label>
+        <p class="settings-note" id="model-description"></p>
+        <label>Уровень рассуждения <select name="effort"></select></label>
+        <label>Разрешения <select name="permission"></select></label>
+        <p class="settings-note" id="permission-description"></p>
+        <label class="full-warning" id="full-warning" hidden><input type="checkbox" name="confirmFull"> Подтверждаю полный доступ без песочницы и подтверждений</label>
+      </div>
+      <p class="settings-note">Настройки действуют со следующего хода агента в этом чате.</p>
+      <p class="inline-error" id="agent-error" role="alert" hidden></p>
+      <button class="send" type="submit" id="save-agent">Сохранить</button>
     </form>
   </dialog>
 </body>

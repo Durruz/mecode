@@ -17,6 +17,23 @@ const streams = new Map();
 const sending = new Set();
 const savingTarget = new Map();
 const stopping = new Set();
+const drawerTriggers = new Map();
+const narrowInspector = matchMedia("(max-width: 940px)");
+const narrowSidebar = matchMedia("(max-width: 650px)");
+const permissions = {
+  read: ["Только чтение", "Агент может читать файлы, запись отключена."],
+  edits: ["Accept Edits", "Правки разрешены внутри папки проекта."],
+  auto: ["Approve for me", "Правки ограничены папкой проекта, запросы на действия проверяются автоматически."],
+  full: ["Full Access", "Любые файлы и команды доступны без песочницы и подтверждений."]
+};
+const claudePermissionDescriptions = {
+  read: "Режим dontAsk. Claude читает файлы, действия с запросом разрешения отклоняются.",
+  edits: "Правки проекта принимаются автоматически. Действия, требующие разрешения, отклоняются. Песочницы ОС нет.",
+  auto: "Claude проверяет действия классификатором. Он может разрешить действие вне папки проекта."
+};
+const agentDialog = $("agent-dialog");
+const agentForm = $("agent-form");
+const tokenNumber = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
 const radios = [...document.querySelectorAll('input[name="target"]')];
 const composer = $("composer");
 const draft = $("draft");
@@ -37,6 +54,12 @@ let mentionIndex = 0;
 let options = [];
 let roomAction = null;
 let dialogTrigger = null;
+let agentEdit = null;
+let modelCatalog = null;
+let modelCatalogLoadedAt = 0;
+let catalogRequest = null;
+let quotas = null;
+let quotaRequest = false;
 
 // Agent output stays in the chat. Render link text and image captions without loading remote content.
 markdown.renderer.rules.link_open = (tokens, index) => {
@@ -185,7 +208,9 @@ function renderControls() {
   const title = room?.title || "Чаты проекта";
   $("room-title").textContent = title;
   $("room-actions").hidden = !room;
-  $("project-name").textContent = workspace?.split(/[\\/]/).filter(Boolean).at(-1) || "Рабочая папка";
+  $("project-name").textContent = workspace?.replace(/^\\\\\?\\/, "").split(/[\\/]/).filter(Boolean).at(-1) || "Выбрать папку";
+  $("change-workspace").title = workspace ? `${workspace}\nНовый чат в другой папке` : "Выбрать папку проекта";
+  $("change-workspace").disabled = !connected;
   $("workspace-path").textContent = workspace || "Выберите чат";
   $("workspace-path").title = workspace || "";
   $("new-room").disabled = !connected;
@@ -201,6 +226,35 @@ function renderControls() {
   $("stop").hidden = !room?.busy.length;
   $("stop").disabled = !connected || stopping.has(activeId);
   $("queue-status").textContent = room?.busy.map((agent) => `${names[agent]} работает…`).join("  ") || "";
+  for (const button of document.querySelectorAll("[data-agent-settings]")) {
+    const agent = button.dataset.agentSettings;
+    const settings = room?.agents?.[agent];
+    const model = settings?.model;
+    const modelName = model ? modelCatalog?.[agent]?.find((entry) => entry.id === model)?.name || model : "По умолчанию";
+    const permission = permissions[settings?.permission]?.[0];
+    const caption = button.querySelector(".agent-config");
+    caption.textContent = [modelName, settings?.effort, permission].filter(Boolean).join(" · ");
+    button.title = caption.textContent;
+    button.disabled = !connected || !settings;
+    button.classList.toggle("full-access", settings?.permission === "full");
+    $("status-" + agent).textContent = contextSummary(room?.context?.[agent]);
+  }
+}
+
+function contextSummary(context) {
+  if (context?.used == null) return "—";
+  const used = tokenNumber.format(context.used);
+  return context.window > 0 ? `${used} / ${tokenNumber.format(context.window)}` : `${used} ток.`;
+}
+
+function meter(value, max, label) {
+  const element = node("progress", "meter");
+  element.max = max > 0 ? max : 1;
+  element.value = value == null || !(max > 0) ? 0 : Math.min(max, Math.max(0, value));
+  element.classList.toggle("unknown", value == null || !(max > 0));
+  element.setAttribute("aria-label", label);
+  if (value == null || !(max > 0)) element.setAttribute("aria-hidden", "true");
+  return element;
 }
 
 function renderContext() {
@@ -211,12 +265,24 @@ function renderContext() {
     const card = node("div", "agent-card");
     const working = room?.busy.includes(agent);
     const status = working ? "Работает" : health && !health[agent] ? "CLI недоступен" : "Ожидает";
-    card.append(avatar(agent), node("strong", "", names[agent]), node("span", working ? "agent-state working" : "agent-state", status));
+    const top = node("div", "agent-card-top");
+    top.append(avatar(agent), node("strong", "", names[agent]), node("span", working ? "agent-state working" : "agent-state", status));
+    const context = room?.context?.[agent];
+    const usage = node("div", "meter-caption");
+    usage.append(node("span", "", "Контекст"), node("span", "", contextSummary(context)));
+    card.classList.add(agent);
+    card.append(top, usage, meter(context?.used, context?.window, `Контекст ${names[agent]}`));
     if (health?.[agent]) card.title = health[agent];
     list.append(card);
   }
   const content = $("panel-content");
   content.replaceChildren();
+  $("limits-toolbar").hidden = panel !== "limits";
+  $("limits-error").hidden = panel !== "limits" || !$("limits-error").textContent;
+  if (panel === "limits") {
+    renderLimits(content);
+    return;
+  }
   if (panel === "workspace") {
     content.append(node("p", "workspace-value", room?.workspace || "Выберите чат"));
     return;
@@ -237,6 +303,85 @@ function renderContext() {
     timeline.append(row);
   }
   content.append(timeline);
+}
+
+function resetText(epoch) {
+  if (!(epoch > 0)) return "Сброс неизвестен";
+  const minutes = Math.ceil((epoch * 1000 - Date.now()) / 60000);
+  if (minutes <= 0) return "Время сброса прошло";
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor(minutes % 1440 / 60);
+  const rest = minutes % 60;
+  const parts = [days && `${days} д`, hours && `${hours} ч`, rest && `${rest} мин`].filter(Boolean);
+  return `Сброс через ${parts.join(" ")}`;
+}
+
+function mergeQuotas(next) {
+  quotas ||= {};
+  for (const agent of agents) {
+    if (!Object.hasOwn(next, agent)) continue;
+    const latest = next[agent];
+    const current = quotas[agent];
+    if (!latest || !current || Date.parse(latest.updated_at) >= Date.parse(current.updated_at)) quotas[agent] = latest;
+  }
+  const usage = agents.flatMap((agent) => {
+    const percent = quotas[agent]?.windows?.find((window) => window.id === "5h")?.used_percent;
+    return Number.isFinite(percent) ? [`${initials[agent]} ${Math.round(percent)}%`] : [];
+  });
+  $("status-limits").textContent = usage.length ? `5h · ${usage.join(" / ")}` : "";
+  if (panel === "limits") renderContext();
+}
+
+function renderLimits(content) {
+  for (const agent of agents) {
+    const limits = quotas?.[agent];
+    const group = node("section", `quota-card ${agent}`);
+    const heading = node("div", "quota-heading");
+    const plan = limits?.plan;
+    const planLabel = plan ? plan.charAt(0).toUpperCase() + plan.slice(1) : "—";
+    heading.append(node("strong", "", names[agent]), node("span", "", planLabel));
+    group.append(heading);
+    if (!limits?.windows?.length) {
+      group.append(node("p", "empty-panel", quotaRequest ? "Загружаем…" : "Данных пока нет"));
+    } else {
+      for (const id of ["5h", "7d"]) {
+        const window = limits.windows.find((item) => item.id === id);
+        const value = Number.isFinite(window?.used_percent) ? window.used_percent : null;
+        const caption = node("div", "meter-caption");
+        caption.append(node("span", "", id), node("span", "", value === null ? "—" : `${Math.round(value)}% использовано`));
+        const reset = node("small", "", resetText(window?.resets_at));
+        if (window?.resets_at) reset.dataset.reset = String(window.resets_at);
+        group.append(caption, meter(value, 100, `${names[agent]}, ${id}`), reset);
+      }
+    }
+    if (limits?.updated_at) {
+      const updated = new Date(limits.updated_at);
+      if (!Number.isNaN(updated.getTime())) {
+        group.title = `Обновлено ${date.format(updated)} в ${clock.format(updated)}`;
+      }
+    }
+    content.append(group);
+  }
+}
+
+async function loadLimits(refresh = false) {
+  if (quotaRequest) return;
+  quotaRequest = true;
+  $("refresh-limits").disabled = true;
+  $("refresh-limits").textContent = refresh ? "Обновляем…" : "↻ Обновить";
+  showError("limits-error", null);
+  if (panel === "limits") renderContext();
+  try {
+    const path = refresh ? "/api/limits/refresh" : "/api/limits";
+    mergeQuotas(await request(path, refresh ? "POST" : "GET"));
+  } catch (error) {
+    if (refresh || panel === "limits") showError("limits-error", error);
+  } finally {
+    quotaRequest = false;
+    $("refresh-limits").disabled = !connected;
+    $("refresh-limits").textContent = "↻ Обновить";
+    if (panel === "limits") renderContext();
+  }
 }
 
 async function loadHistory(id, scrollToEnd = false) {
@@ -291,7 +436,10 @@ function applyEvent(event) {
     else {
       renderRooms();
       renderControls();
+      if (event.room.id === activeId) renderContext();
     }
+  } else if (event.type === "limits" && agents.includes(event.agent)) {
+    if (event.limits) mergeQuotas({ [event.agent]: event.limits });
   } else if (event.type === "room_deleted") {
     forgetRoom(id);
   } else if (event.type === "agent_status" && room) {
@@ -341,6 +489,7 @@ function setConnection(value) {
   connected = value;
   $("connection").classList.toggle("online", value);
   $("connection-text").textContent = value ? "Локально" : "Переподключение…";
+  $("refresh-limits").disabled = !value || quotaRequest;
   renderControls();
 }
 
@@ -372,6 +521,8 @@ function connect() {
       setConnection(true);
       renderRooms();
       renderContext();
+      void loadLimits();
+      if (rooms.get(activeId)?.agents) void loadModels().catch(() => {});
       if (resync) void sync();
     } catch (error) {
       showError("inline-error", error);
@@ -518,14 +669,14 @@ $("stop").addEventListener("click", async () => {
   }
 });
 
-function openRoomDialog(mode) {
+function openRoomDialog(mode, trigger = null) {
   const room = rooms.get(activeId);
   const creating = mode === "create";
   const deleting = mode === "delete";
   const titleInput = roomForm.elements.title;
   const workspace = roomForm.elements.workspace;
   roomAction = { mode, id: room?.id };
-  dialogTrigger = creating ? $("new-room") : $("room-actions-toggle");
+  dialogTrigger = trigger || (creating ? $("new-room") : $("room-actions-toggle"));
   setRoomMenu(false);
   roomForm.reset();
   titleInput.value = creating ? "" : room.title;
@@ -533,6 +684,7 @@ function openRoomDialog(mode) {
   titleInput.closest("label").hidden = deleting;
   titleInput.required = mode === "rename";
   $("workspace-field").hidden = !creating;
+  $("workspace-note").hidden = !creating;
   workspace.required = creating;
   $("delete-warning").hidden = !deleting;
   if (deleting) $("delete-warning").textContent = `История чата «${room.title}» будет удалена. Работа агентов в этом чате остановится.`;
@@ -546,6 +698,11 @@ function openRoomDialog(mode) {
 }
 
 $("new-room").addEventListener("click", () => openRoomDialog("create"));
+$("change-workspace").addEventListener("click", () => {
+  openRoomDialog("create", $("change-workspace"));
+  if (!$("pick-folder").hidden) $("pick-folder").click();
+  else roomForm.elements.workspace.focus();
+});
 $("rename-room").addEventListener("click", () => openRoomDialog("rename"));
 $("delete-room").addEventListener("click", () => openRoomDialog("delete"));
 $("cancel-room").addEventListener("click", () => dialog.close());
@@ -597,13 +754,149 @@ roomForm.addEventListener("submit", async (event) => {
   }
 });
 
-function setDrawer(drawer, open) {
+async function loadModels() {
+  if (modelCatalog && Date.now() - modelCatalogLoadedAt < 600000) return modelCatalog;
+  if (!catalogRequest) {
+    catalogRequest = request("/api/models").then((result) => {
+      modelCatalog = result;
+      modelCatalogLoadedAt = Date.now();
+      renderControls();
+      return result;
+    }).finally(() => { catalogRequest = null; });
+  }
+  return catalogRequest;
+}
+
+function addOption(select, value, label) {
+  const element = node("option", "", label);
+  element.value = value;
+  select.append(element);
+}
+
+function updateEfforts(savedEffort = "") {
+  const { model, effort } = agentForm.elements;
+  const available = modelCatalog?.[agentEdit.agent] || [];
+  const details = model.value
+    ? available.find((entry) => entry.id === model.value)
+    : available.find((entry) => entry.is_default);
+  $("model-description").textContent = details?.description || "";
+  effort.replaceChildren();
+  const automatic = details?.default_effort;
+  addOption(effort, "", automatic ? `По умолчанию (${automatic})` : "По умолчанию");
+  const supported = new Set(details?.efforts || []);
+  if (savedEffort) supported.add(savedEffort);
+  for (const value of supported) addOption(effort, value, value);
+  effort.value = savedEffort;
+}
+
+function updatePermission() {
+  const { permission, confirmFull } = agentForm.elements;
+  const full = permission.value === "full";
+  const providerDescription = agentEdit.agent === "claude" && claudePermissionDescriptions[permission.value];
+  $("permission-description").textContent = providerDescription || permissions[permission.value][1];
+  $("permission-description").classList.toggle("full-access", full);
+  $("full-warning").hidden = !full || agentEdit.originalPermission === "full";
+  confirmFull.required = !$("full-warning").hidden;
+  confirmFull.checked = false;
+}
+
+async function openAgentSettings(button) {
+  const agent = button.dataset.agentSettings;
+  const settings = rooms.get(activeId)?.agents?.[agent];
+  if (!settings || !connected) return;
+  const edit = { id: activeId, agent, originalPermission: settings.permission, button };
+  agentEdit = edit;
+  agentForm.reset();
+  $("agent-dialog-title").textContent = `Настройки ${names[agent]}`;
+  const { model, effort, permission } = agentForm.elements;
+  model.replaceChildren();
+  addOption(model, "", "По умолчанию");
+  if (settings.model) addOption(model, settings.model, settings.model);
+  model.value = settings.model;
+  permission.replaceChildren();
+  for (const [id, [label]] of Object.entries(permissions)) addOption(permission, id, label);
+  permission.value = Object.hasOwn(permissions, settings.permission) ? settings.permission : "read";
+  updateEfforts(settings.effort);
+  updatePermission();
+  showError("agent-error", null);
+  model.disabled = effort.disabled = $("save-agent").disabled = true;
+  agentDialog.showModal();
+  permission.focus();
+  try {
+    const catalog = await loadModels();
+    if (agentEdit !== edit) return;
+    const entries = catalog[agent] || [];
+    model.replaceChildren();
+    const defaultModel = entries.find((entry) => entry.is_default);
+    addOption(model, "", defaultModel?.id ? `По умолчанию · ${defaultModel.name}` : "По умолчанию");
+    for (const entry of entries) {
+      if (entry.id) addOption(model, entry.id, entry.name);
+    }
+    if (settings.model && !entries.some((entry) => entry.id === settings.model)) {
+      addOption(model, settings.model, settings.model);
+    }
+    model.value = settings.model;
+    updateEfforts(settings.effort);
+    model.disabled = effort.disabled = false;
+  } catch {
+    if (agentEdit === edit) showError("agent-error", "Каталог моделей недоступен. Можно изменить разрешения.");
+  } finally {
+    if (agentEdit === edit) $("save-agent").disabled = !connected;
+  }
+}
+
+for (const button of document.querySelectorAll("[data-agent-settings]")) {
+  button.addEventListener("click", () => void openAgentSettings(button));
+}
+agentForm.elements.model.addEventListener("change", () => updateEfforts());
+agentForm.elements.permission.addEventListener("change", updatePermission);
+$("cancel-agent").addEventListener("click", () => agentDialog.close());
+agentDialog.addEventListener("cancel", (event) => {
+  if ($("cancel-agent").disabled) event.preventDefault();
+});
+agentDialog.addEventListener("close", () => {
+  agentEdit?.button.focus();
+  agentEdit = null;
+});
+agentForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!agentEdit || !connected || $("save-agent").disabled) return;
+  const { id, agent } = agentEdit;
+  const { model, effort, permission } = agentForm.elements;
+  const settings = { model: model.value, effort: effort.value, permission: permission.value };
+  $("cancel-agent").disabled = $("save-agent").disabled = true;
+  showError("agent-error", null);
+  try {
+    const result = await request(roomPath(id, `/agents/${agent}`), "PUT", settings);
+    if (rooms.has(id)) {
+      const room = rooms.get(id);
+      room.agents = { ...room.agents, [agent]: result.agents[agent] };
+      renderControls();
+    }
+    agentDialog.close();
+  } catch (error) {
+    showError("agent-error", error);
+  } finally {
+    $("cancel-agent").disabled = $("save-agent").disabled = false;
+  }
+});
+
+function setDrawer(drawer, open, trigger = null) {
   const containsFocus = drawer.contains(document.activeElement);
   drawer.classList.toggle("is-open", open);
   const toggles = [...document.querySelectorAll(`[aria-controls="${drawer.id}"]`)];
   for (const button of toggles) button.setAttribute("aria-expanded", String(open));
-  if (open) drawer.querySelector("button")?.focus();
-  else if (containsFocus) toggles.find((button) => button.getClientRects().length)?.focus();
+  if (open) {
+    drawerTriggers.set(drawer, trigger);
+    drawer.querySelector("button")?.focus();
+  } else {
+    const origin = drawerTriggers.get(drawer);
+    if (containsFocus) {
+      const target = origin?.getClientRects().length ? origin : toggles.find((button) => button.getClientRects().length);
+      target?.focus();
+    }
+    drawerTriggers.delete(drawer);
+  }
 }
 
 function setRoomMenu(open) {
@@ -620,24 +913,47 @@ $("room-list").addEventListener("click", (event) => {
 });
 $("navigation-toggle").addEventListener("click", () => {
   setDrawer($("inspector"), false);
-  setDrawer($("sidebar"), !$("sidebar").classList.contains("is-open"));
+  setDrawer($("sidebar"), !$("sidebar").classList.contains("is-open"), $("navigation-toggle"));
 });
 for (const toggle of document.querySelectorAll(".panel-toggle")) {
   toggle.addEventListener("click", () => {
     setDrawer($("sidebar"), false);
-    setDrawer($("inspector"), !$("inspector").classList.contains("is-open"));
+    setDrawer($("inspector"), !$("inspector").classList.contains("is-open"), toggle);
   });
 }
+narrowInspector.addEventListener("change", (event) => {
+  if (!event.matches) setDrawer($("inspector"), false);
+});
+narrowSidebar.addEventListener("change", (event) => {
+  if (!event.matches) setDrawer($("sidebar"), false);
+});
 document.querySelector(".panel-close").addEventListener("click", () => setDrawer($("inspector"), false));
-for (const button of document.querySelectorAll("[data-panel]")) {
-  button.addEventListener("click", () => {
-    panel = button.dataset.panel;
-    for (const tab of document.querySelectorAll("[data-panel]")) tab.setAttribute("aria-pressed", String(tab === button));
-    renderContext();
-  });
+function selectPanel(next) {
+  panel = next;
+  for (const tab of document.querySelectorAll("[data-panel]")) {
+    tab.setAttribute("aria-pressed", String(tab.dataset.panel === next));
+  }
+  renderContext();
+  if (panel === "limits" && !quotas && connected) void loadLimits();
 }
+
+for (const button of document.querySelectorAll("[data-panel]")) {
+  button.addEventListener("click", () => selectPanel(button.dataset.panel));
+}
+$("open-limits").addEventListener("click", () => {
+  setDrawer($("sidebar"), false);
+  if (narrowInspector.matches) setDrawer($("inspector"), true, $("open-limits"));
+  selectPanel("limits");
+  document.querySelector('[data-panel="limits"]').focus();
+});
+$("refresh-limits").addEventListener("click", () => void loadLimits(true));
+setInterval(() => {
+  for (const element of document.querySelectorAll("[data-reset]")) {
+    element.textContent = resetText(Number(element.dataset.reset));
+  }
+}, 30000);
 document.addEventListener("keydown", (event) => {
-  if (event.key !== "Escape" || event.defaultPrevented || dialog.open) return;
+  if (event.key !== "Escape" || event.defaultPrevented || dialog.open || agentDialog.open) return;
   if (!$("room-action-list").hidden) {
     setRoomMenu(false);
     $("room-actions-toggle").focus();
