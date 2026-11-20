@@ -42,6 +42,13 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/rooms/{id}/stop", post(stop))
         .route("/api/rooms/{id}/target", put(set_target))
         .route("/api/rooms/{id}/agents/{agent}", put(set_agent))
+        .route(
+            "/api/rooms/{id}/attachments",
+            post(upload).layer(axum::extract::DefaultBodyLimit::max(26 * 1024 * 1024)),
+        )
+        .route("/api/rooms/{id}/handoff", post(handoff))
+        .route("/api/prompts", get(list_prompts).post(save_prompt))
+        .route("/api/prompts/{id}", axum::routing::delete(delete_prompt))
         .route("/api/models", get(models))
         .route("/api/limits", get(limits))
         .route("/api/limits/refresh", post(refresh_limits))
@@ -154,11 +161,62 @@ async fn messages(State(hub): State<Arc<Hub>>, Path(id): Path<String>) -> ApiRes
 
 #[derive(Deserialize)]
 struct Send {
+    #[serde(default)]
     text: String,
+    #[serde(flatten)]
+    opts: mecode_core::hub::SendOptions,
 }
 
 async fn send(State(hub): State<Arc<Hub>>, Path(id): Path<String>, Json(body): Json<Send>) -> ApiResult<mecode_core::Message> {
-    Ok(Json(hub.send(&id, &body.text)?))
+    Ok(Json(hub.send(&id, &body.text, body.opts)?))
+}
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    name: String,
+}
+
+/// Тело запроса — сырые байты файла, имя — в `?name=`.
+async fn upload(
+    State(hub): State<Arc<Hub>>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<UploadQuery>,
+    body: axum::body::Bytes,
+) -> ApiResult<mecode_core::Attachment> {
+    Ok(Json(hub.add_attachment(&id, &q.name, &body)?))
+}
+
+#[derive(Deserialize, Default)]
+struct Handoff {
+    #[serde(default)]
+    title: String,
+}
+
+async fn handoff(State(hub): State<Arc<Hub>>, Path(id): Path<String>, body: Option<Json<Handoff>>) -> ApiResult<mecode_core::Room> {
+    let title = body.map(|b| b.0.title).unwrap_or_default();
+    Ok(Json(hub.handoff(&id, &title)?))
+}
+
+async fn list_prompts(State(hub): State<Arc<Hub>>) -> Json<Vec<mecode_core::SavedPrompt>> {
+    Json(hub.prompts())
+}
+
+#[derive(Deserialize)]
+struct PromptBody {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    title: String,
+    text: String,
+}
+
+async fn save_prompt(State(hub): State<Arc<Hub>>, Json(b): Json<PromptBody>) -> ApiResult<mecode_core::SavedPrompt> {
+    Ok(Json(hub.save_prompt(mecode_core::SavedPrompt { id: b.id, title: b.title, text: b.text })?))
+}
+
+async fn delete_prompt(State(hub): State<Arc<Hub>>, Path(id): Path<String>) -> ApiResult<serde_json::Value> {
+    hub.delete_prompt(&id)?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn stop(State(hub): State<Arc<Hub>>, Path(id): Path<String>) -> ApiResult<serde_json::Value> {

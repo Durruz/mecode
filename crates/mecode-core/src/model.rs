@@ -87,6 +87,30 @@ pub struct Message {
     pub kind: MessageKind,
     pub text: String,
     pub ts: DateTime<Utc>,
+    /// Файлы, приложенные пользователем.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
+    /// Режим плана: агенты только читают и предлагают план.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan: bool,
+}
+
+/// Приложенный файл. Хранится в папке данных чата.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub id: String,
+    pub name: String,
+    pub path: PathBuf,
+    pub size: u64,
+    pub is_image: bool,
+}
+
+/// Сохранённый промпт.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedPrompt {
+    pub id: String,
+    pub title: String,
+    pub text: String,
 }
 
 /// Кому по умолчанию уходит сообщение пользователя без @упоминаний.
@@ -123,6 +147,8 @@ pub struct AgentSettings {
     /// "" = уровень рассуждения по умолчанию.
     pub effort: String,
     pub permission: Permission,
+    /// Быстрый режим (сейчас только Codex: service_tier="priority", расходует лимит быстрее).
+    pub fast: bool,
 }
 
 impl AgentSettings {

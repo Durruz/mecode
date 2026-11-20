@@ -33,6 +33,9 @@ pub fn command(cfg: &AgentConfig, spec: &TurnSpec) -> (Command, String) {
     if !s.effort.is_empty() {
         cmd.args(["--effort", &s.effort]);
     }
+    for d in &spec.extra_dirs {
+        cmd.arg("--add-dir").arg(d);
+    }
     if let Some(s) = &spec.session {
         cmd.args(["--resume", s]);
     }

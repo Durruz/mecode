@@ -22,7 +22,9 @@ use tokio_util::sync::CancellationToken;
 use crate::agents::info::{self, ModelInfo};
 use crate::agents::{self, AgentEvent, TurnSpec};
 use crate::config::Config;
-use crate::model::{AgentId, AgentSettings, Author, ContextUsage, Event, Limits, Message, MessageKind, Room, Target};
+use crate::model::{
+    AgentId, AgentSettings, Attachment, Author, ContextUsage, Event, Limits, Message, MessageKind, Room, SavedPrompt, Target,
+};
 use crate::router;
 use crate::store::Store;
 
@@ -42,6 +44,8 @@ struct RoomState {
     pending: HashSet<AgentId>,
     /// Сколько раз подряд агенты разбудили друг друга после последнего сообщения пользователя.
     hops: u32,
+    /// Загруженные, но ещё не отправленные вложения.
+    uploads: HashMap<String, Attachment>,
 }
 
 impl RoomState {
@@ -81,6 +85,7 @@ pub struct Hub {
     limits: Mutex<AllLimits>,
     models: tokio::sync::Mutex<Option<(Instant, Models)>>,
     tx: broadcast::Sender<Event>,
+    prompts_lock: Mutex<()>,
 }
 
 impl Hub {
@@ -94,7 +99,7 @@ impl Hub {
             }
             rooms.insert(
                 room.id.clone(),
-                RoomState { room, messages, running: HashMap::new(), pending: HashSet::new(), hops: 0 },
+                RoomState { room, messages, running: HashMap::new(), pending: HashSet::new(), hops: 0, uploads: HashMap::new() },
             );
         }
         let limits = std::fs::read_to_string(data_dir.join("limits.json"))
@@ -109,6 +114,7 @@ impl Hub {
             rooms: Mutex::new(rooms),
             limits: Mutex::new(limits),
             models: tokio::sync::Mutex::new(None),
+            prompts_lock: Mutex::new(()),
             tx,
         }))
     }
@@ -251,7 +257,7 @@ impl Hub {
             context: HashMap::new(),
         };
         self.store.save_room(&room)?;
-        let state = RoomState { room: room.clone(), messages: Vec::new(), running: HashMap::new(), pending: HashSet::new(), hops: 0 };
+        let state = RoomState { room: room.clone(), messages: Vec::new(), running: HashMap::new(), pending: HashSet::new(), hops: 0, uploads: HashMap::new() };
         self.rooms.lock().unwrap().insert(room.id.clone(), state);
         self.emit(Event::RoomUpdated { room: room.clone() });
         Ok(room)
@@ -290,15 +296,41 @@ impl Hub {
         Ok(())
     }
 
+    /// Сохраняет приложенный файл. Он уйдёт агентам с ближайшим сообщением, где указан его `id`.
+    pub fn add_attachment(&self, room_id: &str, name: &str, bytes: &[u8]) -> anyhow::Result<Attachment> {
+        const MAX: usize = 25 * 1024 * 1024;
+        anyhow::ensure!(!bytes.is_empty(), "пустой файл");
+        anyhow::ensure!(bytes.len() <= MAX, "файл больше 25 МБ");
+        let mut rooms = self.rooms.lock().unwrap();
+        let st = rooms.get_mut(room_id).context("комната не найдена")?;
+        let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+        let att = self.store.save_attachment(room_id, &id, name, bytes)?;
+        st.uploads.insert(id, att.clone());
+        Ok(att)
+    }
+
     /// Сообщение пользователя в чат.
-    pub fn send(self: &Arc<Self>, room_id: &str, text: &str) -> anyhow::Result<Message> {
+    pub fn send(self: &Arc<Self>, room_id: &str, text: &str, opts: SendOptions) -> anyhow::Result<Message> {
         let text = text.trim();
-        if text.is_empty() {
+        if text.is_empty() && opts.attachments.is_empty() {
             bail!("пустое сообщение");
         }
         let mut rooms = self.rooms.lock().unwrap();
         let st = rooms.get_mut(room_id).context("комната не найдена")?;
-        let msg = self.push(st, Author::User, MessageKind::Chat, text.to_string());
+        let mut attachments = Vec::new();
+        for id in &opts.attachments {
+            attachments.push(st.uploads.remove(id).with_context(|| format!("вложение {id} не найдено"))?);
+        }
+        let msg = Message {
+            seq: st.next_seq(),
+            author: Author::User,
+            kind: MessageKind::Chat,
+            text: text.to_string(),
+            ts: Utc::now(),
+            attachments,
+            plan: opts.plan,
+        };
+        self.push_message(st, msg.clone());
         st.hops = 0;
         for agent in router::user_targets(text, st.room.default_target) {
             self.schedule(st, agent);
@@ -322,13 +354,91 @@ impl Hub {
     }
 
     fn push(&self, st: &mut RoomState, author: Author, kind: MessageKind, text: String) -> Message {
-        let msg = Message { seq: st.next_seq(), author, kind, text, ts: Utc::now() };
+        let msg = Message {
+            seq: st.next_seq(),
+            author,
+            kind,
+            text,
+            ts: Utc::now(),
+            attachments: Vec::new(),
+            plan: false,
+        };
+        self.push_message(st, msg.clone());
+        msg
+    }
+
+    fn push_message(&self, st: &mut RoomState, msg: Message) {
         if let Err(e) = self.store.append_message(&st.room.id, &msg) {
             tracing::error!("не удалось сохранить сообщение: {e}");
         }
         st.messages.push(msg.clone());
-        self.emit(Event::Message { room_id: st.room.id.clone(), message: msg.clone() });
-        msg
+        self.emit(Event::Message { room_id: st.room.id.clone(), message: msg });
+    }
+
+    /// Новый чат в той же папке, куда переносится история текущего (как «Hand off to new thread»).
+    /// Агенты начинают новые сессии и получают историю первым сообщением.
+    pub fn handoff(&self, room_id: &str, title: &str) -> anyhow::Result<Room> {
+        let (workspace, old_title, agents, transcript) = {
+            let rooms = self.rooms.lock().unwrap();
+            let st = rooms.get(room_id).context("комната не найдена")?;
+            (st.room.workspace.clone(), st.room.title.clone(), st.room.agents.clone(), handoff_transcript(&st.messages))
+        };
+        let title = if title.trim().is_empty() { format!("{old_title} (продолжение)") } else { title.to_string() };
+        let room = self.create_room(&title, &workspace.to_string_lossy())?;
+        let mut rooms = self.rooms.lock().unwrap();
+        let st = rooms.get_mut(&room.id).context("комната не найдена")?;
+        st.room.agents = agents;
+        self.store.save_room(&st.room)?;
+        if !transcript.is_empty() {
+            self.push(
+                st,
+                Author::System,
+                MessageKind::Chat,
+                format!("Продолжение чата «{old_title}». Краткая история:\n\n{transcript}"),
+            );
+        }
+        self.emit(Event::RoomUpdated { room: st.room.clone() });
+        Ok(st.room.clone())
+    }
+
+    pub fn prompts(&self) -> Vec<SavedPrompt> {
+        self.load_prompts()
+    }
+
+    fn load_prompts(&self) -> Vec<SavedPrompt> {
+        std::fs::read_to_string(self.data_dir.join("prompts.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Создаёт (пустой `id`) или обновляет сохранённый промпт.
+    pub fn save_prompt(&self, mut p: SavedPrompt) -> anyhow::Result<SavedPrompt> {
+        anyhow::ensure!(!p.text.trim().is_empty(), "пустой промпт");
+        let _guard = self.prompts_lock.lock().unwrap();
+        let mut all = self.load_prompts();
+        if p.title.trim().is_empty() {
+            p.title = p.text.trim().chars().take(40).collect();
+        }
+        match all.iter_mut().find(|x| !p.id.is_empty() && x.id == p.id) {
+            Some(x) => *x = p.clone(),
+            None => {
+                p.id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+                all.push(p.clone());
+            }
+        }
+        std::fs::write(self.data_dir.join("prompts.json"), serde_json::to_string_pretty(&all)?)?;
+        Ok(p)
+    }
+
+    pub fn delete_prompt(&self, id: &str) -> anyhow::Result<()> {
+        let _guard = self.prompts_lock.lock().unwrap();
+        let mut all = self.load_prompts();
+        let before = all.len();
+        all.retain(|p| p.id != id);
+        anyhow::ensure!(all.len() < before, "промпт не найден");
+        std::fs::write(self.data_dir.join("prompts.json"), serde_json::to_string_pretty(&all)?)?;
+        Ok(())
     }
 
     fn schedule(self: &Arc<Self>, st: &mut RoomState, agent: AgentId) {
@@ -350,16 +460,36 @@ impl Hub {
         if fresh.is_empty() {
             return;
         }
-        let prompt = format_prompt(agent, &fresh);
+        let plan = fresh.iter().any(|m| m.plan);
+        let mut prompt = format_prompt(agent, &fresh);
+        if plan {
+            prompt.push_str(
+                "\n\nРежим плана: ничего не меняй и не запускай изменяющих команд. Изучи проект и предложи пошаговый план.",
+            );
+        }
+        let attachments: Vec<&Attachment> = fresh.iter().flat_map(|m| &m.attachments).collect();
+        let images = attachments.iter().filter(|a| a.is_image).map(|a| a.path.clone()).collect();
+        let extra_dirs = attachments
+            .iter()
+            .filter_map(|a| a.path.parent().map(|p| p.to_path_buf()))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
         st.room.cursors.insert(agent, last.seq);
 
+        let mut settings = st.room.agents.get(&agent).cloned().unwrap_or_else(|| self.cfg.agent(agent).defaults());
+        if plan {
+            settings.permission = crate::model::Permission::Read;
+        }
         let spec = TurnSpec {
             agent,
             workspace: st.room.workspace.clone(),
             session: st.room.sessions.get(&agent).cloned(),
             prompt,
             system: system_prompt(agent),
-            settings: st.room.agents.get(&agent).cloned().unwrap_or_else(|| self.cfg.agent(agent).defaults()),
+            settings,
+            images,
+            extra_dirs,
         };
         let token = CancellationToken::new();
         st.running.insert(agent, token.clone());
@@ -477,10 +607,49 @@ impl Hub {
 fn format_prompt(agent: AgentId, fresh: &[&Message]) -> String {
     let mut s = String::from("Новые сообщения в общем чате Mecode:\n\n");
     for m in fresh {
-        s.push_str(&format!("[{}]: {}\n\n", m.author.name(), m.text));
+        s.push_str(&format!("[{}]: {}\n", m.author.name(), m.text));
+        if !m.attachments.is_empty() {
+            s.push_str("Вложения (прочитай с диска):\n");
+            for a in &m.attachments {
+                s.push_str(&format!("- {}: {}\n", a.name, a.path.display()));
+            }
+        }
+        s.push('\n');
     }
     s.push_str(&format!("Ответь как {}.", agent.display()));
     s
+}
+
+/// Параметры сообщения пользователя.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SendOptions {
+    /// `id` вложений, загруженных через `add_attachment`.
+    pub attachments: Vec<String>,
+    pub plan: bool,
+}
+
+/// История для нового чата: последние реплики, обрезанные по длине.
+fn handoff_transcript(messages: &[Message]) -> String {
+    const MAX_MSG: usize = 1500;
+    const MAX_TOTAL: usize = 30_000;
+    let mut parts: Vec<String> = Vec::new();
+    let mut total = 0;
+    for m in messages.iter().rev().filter(|m| m.kind == MessageKind::Chat) {
+        let line = format!("[{}]: {}", m.author.name(), agents_clip(&m.text, MAX_MSG));
+        total += line.len();
+        if total > MAX_TOTAL {
+            break;
+        }
+        parts.push(line);
+    }
+    parts.reverse();
+    parts.join("\n\n")
+}
+
+fn agents_clip(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= max { s.to_string() } else { format!("{}…", s.chars().take(max).collect::<String>()) }
 }
 
 fn system_prompt(agent: AgentId) -> String {
@@ -505,7 +674,7 @@ mod tests {
     use super::*;
 
     fn msg(seq: u64, author: Author, text: &str) -> Message {
-        Message { seq, author, kind: MessageKind::Chat, text: text.into(), ts: Utc::now() }
+        Message { seq, author, kind: MessageKind::Chat, text: text.into(), ts: Utc::now(), attachments: Vec::new(), plan: false }
     }
 
     #[test]
@@ -532,6 +701,20 @@ mod tests {
         assert_eq!(rooms.len(), 1);
         assert_eq!(rooms[0].room.default_target, Target::Codex);
         assert_eq!(rooms[0].room.title, "Мой чат");
+
+        let att = hub.add_attachment(&room.id, "..\\..\\x/../ev il?.PNG", b"img").unwrap();
+        assert_eq!(att.name, "ev il_.PNG");
+        assert!(att.is_image);
+        assert!(att.path.starts_with(std::path::absolute(dir.join("rooms").join(&room.id)).unwrap()));
+        assert!(hub.add_attachment(&room.id, "a.txt", b"").is_err());
+
+        let p = hub.save_prompt(SavedPrompt { id: String::new(), title: String::new(), text: "Проверь тесты".into() }).unwrap();
+        assert_eq!(p.title, "Проверь тесты");
+        hub.save_prompt(SavedPrompt { title: "T".into(), ..p.clone() }).unwrap();
+        assert_eq!(hub.prompts().len(), 1);
+        assert_eq!(hub.prompts()[0].title, "T");
+        hub.delete_prompt(&p.id).unwrap();
+        assert!(hub.prompts().is_empty());
 
         hub.delete(&room.id).unwrap();
         assert!(hub.list_rooms().is_empty());

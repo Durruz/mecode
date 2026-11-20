@@ -43,7 +43,17 @@ pub fn command(cfg: &AgentConfig, spec: &TurnSpec) -> (Command, String) {
     if !s.effort.is_empty() {
         cmd.args(["-c", &format!("model_reasoning_effort=\"{}\"", s.effort)]);
     }
+    if s.fast {
+        cmd.args(["-c", "service_tier=\"priority\""]);
+    }
     cmd.args(&cfg.extra_args);
+    // `-i` принимает несколько файлов подряд, поэтому `--` отделяет их от id сессии и `-`.
+    for img in &spec.images {
+        cmd.arg("-i").arg(img);
+    }
+    if !spec.images.is_empty() {
+        cmd.arg("--");
+    }
     if let Some(s) = &spec.session {
         cmd.arg(s);
     }

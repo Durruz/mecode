@@ -22,18 +22,26 @@ pub struct ModelInfo {
     pub efforts: Vec<String>,
     pub default_effort: Option<String>,
     pub is_default: bool,
+    /// Поддерживает быстрый режим (`AgentSettings.fast`).
+    pub fast: bool,
 }
 
 const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
-/// У Claude Code нет команды со списком моделей; псевдонимы всегда указывают на последние версии.
+/// У Claude Code нет команды со списком моделей. Все ID проверены запросом к CLI 2026-11-20.
 pub fn claude_models() -> Vec<ModelInfo> {
+    const CREDITS: &str = "На Pro нужны дополнительные кредиты";
     [
         ("", "По умолчанию", "Модель из настроек Claude Code"),
-        ("fable", "Fable", "Самая мощная модель Claude"),
-        ("opus", "Opus", "Сложные задачи и большой код"),
-        ("sonnet", "Sonnet", "Баланс скорости и качества"),
-        ("haiku", "Haiku", "Быстрая и экономная"),
+        ("claude-opus-5-5", "Opus 5.5", "Сложные задачи и большой код"),
+        ("claude-sonnet-5-5", "Sonnet 5.5", "Баланс скорости и качества"),
+        ("claude-fable-5-2", "Fable 5.2", CREDITS),
+        ("claude-haiku-5-5", "Haiku 5.5", "Быстрая и экономная"),
+        ("claude-fable-5-1", "Fable 5.1", CREDITS),
+        ("claude-haiku-4-5", "Haiku 4.5", "Предыдущее поколение"),
+        ("claude-sonnet-5", "Sonnet 5", "Предыдущее поколение"),
+        ("claude-opus-5", "Opus 5", "Предыдущее поколение"),
+        ("claude-fable-5", "Fable 5", CREDITS),
     ]
     .iter()
     .map(|(id, name, desc)| ModelInfo {
@@ -43,6 +51,8 @@ pub fn claude_models() -> Vec<ModelInfo> {
         efforts: CLAUDE_EFFORTS.iter().map(|s| s.to_string()).collect(),
         default_effort: None,
         is_default: id.is_empty(),
+        // Claude Code в режиме -p не даёт включить fast mode (sdk_opt_in_required).
+        fast: false,
     })
     .collect()
 }
@@ -98,6 +108,7 @@ pub async fn codex_models(bin: &str) -> anyhow::Result<Vec<ModelInfo>> {
         efforts: Vec::new(),
         default_effort: None,
         is_default: true,
+        fast: true,
     }];
     for m in r["data"].as_array().into_iter().flatten().filter(|m| m["hidden"] != true) {
         let efforts: Vec<String> = m["supportedReasoningEfforts"]
@@ -113,6 +124,7 @@ pub async fn codex_models(bin: &str) -> anyhow::Result<Vec<ModelInfo>> {
             efforts,
             default_effort: m["defaultReasoningEffort"].as_str().map(String::from),
             is_default: false,
+            fast: m["serviceTiers"].as_array().is_some_and(|t| t.iter().any(|x| x["id"] == "priority")),
         });
     }
     // Уровни «по умолчанию» = уровни модели, которая стоит по умолчанию у Codex.

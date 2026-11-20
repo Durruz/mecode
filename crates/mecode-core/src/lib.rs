@@ -10,6 +10,6 @@ pub mod store;
 pub use config::Config;
 pub use hub::Hub;
 pub use model::{
-    AgentId, AgentSettings, Author, ContextUsage, Event, LimitWindow, Limits, Message, MessageKind, Permission, Room,
+    AgentId, AgentSettings, Attachment, Author, SavedPrompt, ContextUsage, Event, LimitWindow, Limits, Message, MessageKind, Permission, Room,
     Target,
 };

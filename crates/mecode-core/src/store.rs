@@ -3,7 +3,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::model::{Message, Room};
+use crate::model::{Attachment, Message, Room};
 
 #[derive(Clone)]
 pub struct Store {
@@ -38,6 +38,31 @@ impl Store {
             .open(self.dir(room_id).join("messages.jsonl"))?;
         writeln!(f, "{}", serde_json::to_string(msg)?)?;
         Ok(())
+    }
+
+    /// Сохраняет вложение в `rooms/<id>/attachments/<aid>-<имя>`. Имя очищается от путей и спецсимволов.
+    pub fn save_attachment(&self, room_id: &str, att_id: &str, name: &str, bytes: &[u8]) -> anyhow::Result<Attachment> {
+        let base = Path::new(name).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut safe: String = base
+            .chars()
+            .map(|c| if c.is_alphanumeric() || "._- ".contains(c) { c } else { '_' })
+            .collect();
+        safe = safe.trim_matches(|c| c == '.' || c == ' ').chars().take(100).collect();
+        if safe.is_empty() {
+            safe = "file".into();
+        }
+        let dir = self.dir(room_id).join("attachments");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{att_id}-{safe}"));
+        std::fs::write(&path, bytes)?;
+        let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        Ok(Attachment {
+            id: att_id.into(),
+            name: safe,
+            path: std::path::absolute(&path)?,
+            size: bytes.len() as u64,
+            is_image: matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"),
+        })
     }
 
     /// Удаляет папку комнаты. Вызывается только для ID, найденного среди загруженных комнат.

@@ -48,6 +48,10 @@ pub struct TurnSpec {
     pub system: String,
     /// Модель, рассуждение, разрешения.
     pub settings: AgentSettings,
+    /// Картинки из новых сообщений (Codex получает их через `-i`).
+    pub images: Vec<PathBuf>,
+    /// Папки вложений (Claude получает к ним доступ через `--add-dir`).
+    pub extra_dirs: Vec<PathBuf>,
 }
 
 pub async fn run_turn(

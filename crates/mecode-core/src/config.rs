@@ -55,7 +55,7 @@ impl AgentConfig {
     }
 
     pub fn defaults(&self) -> AgentSettings {
-        AgentSettings { model: self.model.clone(), effort: self.effort.clone(), permission: self.permission }
+        AgentSettings { model: self.model.clone(), effort: self.effort.clone(), permission: self.permission, fast: false }
     }
 }
 

@@ -12,7 +12,10 @@ type Author  = "user" | "claude" | "codex" | "system";
 type Kind    = "chat" | "activity" | "error";   // activity = команда/правка файла агента
 type Target  = "all" | "claude" | "codex";       // кому уходит сообщение без @упоминаний
 
-interface Message { seq: number; author: Author; kind: Kind; text: string; ts: string /* ISO */ }
+interface Message { seq: number; author: Author; kind: Kind; text: string; ts: string /* ISO */;
+                    attachments?: Attachment[]; plan?: true }
+interface Attachment { id: string; name: string; path: string; size: number; is_image: boolean }
+interface SavedPrompt { id: string; title: string; text: string }
 interface Room {
   id: string; title: string; workspace: string; created: string;
   default_target: Target;
@@ -25,11 +28,13 @@ interface RoomView extends Room { busy: AgentId[] }   // кто сейчас р�
 //   agents:  Record<AgentId, AgentSettings>          — всегда есть оба
 //   context: Partial<Record<AgentId, ContextUsage>>  — появляется после первого хода агента
 type Permission = "read" | "edits" | "auto" | "full";
-interface AgentSettings { model: string /* "" = по умолчанию */; effort: string /* "" = по умолчанию */; permission: Permission }
+interface AgentSettings { model: string /* "" = по умолчанию */; effort: string /* "" = по умолчанию */;
+                          permission: Permission; fast: boolean /* только если ModelInfo.fast */ }
 interface ContextUsage { used: number; window: number | null }
 
 interface ModelInfo { id: string /* "" = по умолчанию */; name: string; description: string;
-                      efforts: string[]; default_effort: string | null; is_default: boolean }
+                      efforts: string[]; default_effort: string | null; is_default: boolean;
+                      fast: boolean /* есть Fast mode: у Codex да, у Claude нет (CLI не даёт в режиме -p) */ }
 interface Limits { plan: string | null /* "pro", "plus"… */;
                    windows: { id: "5h" | "7d"; used_percent: number; resets_at: number | null /* unix сек */ }[];
                    updated_at: string }
@@ -57,7 +62,12 @@ interface Limits { plan: string | null /* "pro", "plus"… */;
 | PATCH | `/api/rooms/{id}` | `{title}` | `Room` — переименование |
 | DELETE | `/api/rooms/{id}` | — | `{ok}` — удаляет чат и историю безвозвратно, агенты останавливаются. В UI спрашивать подтверждение |
 | GET | `/api/rooms/{id}/messages` | — | `Message[]` |
-| POST | `/api/rooms/{id}/messages` | `{text}` | `Message` (сообщение пользователя) |
+| POST | `/api/rooms/{id}/messages` | `{text, attachments?: string[], plan?: boolean}` | `Message` (сообщение пользователя). `attachments` — id загруженных файлов. `plan` — режим плана: в этот ход агенты только читают и предлагают план |
+| POST | `/api/rooms/{id}/attachments?name=<имя>` | сырые байты файла, до 25 МБ | `Attachment`. Файл уходит агентам с сообщением, где указан его id: путь к нему попадает в промпт, картинки Codex получает через `-i` |
+| POST | `/api/rooms/{id}/handoff` | `{title?}` | `Room` — новый чат в той же папке, с теми же настройками агентов и историей первым системным сообщением; сессии агентов новые |
+| GET | `/api/prompts` | — | `SavedPrompt[]` |
+| POST | `/api/prompts` | `{id?, title?, text}` | `SavedPrompt` — без id создаёт, с id обновляет; пустой title = начало текста |
+| DELETE | `/api/prompts/{id}` | — | `{ok}` |
 | POST | `/api/rooms/{id}/stop` | — | `{ok}` — остановить всех агентов комнаты |
 | PUT | `/api/rooms/{id}/target` | `{target}` | `{ok}` |
 
